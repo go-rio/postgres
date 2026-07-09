@@ -1,0 +1,52 @@
+name: Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        go: [ "oldstable", "stable" ]
+        platform: [ ubuntu-latest, macos-latest, windows-latest ]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: ${{ matrix.go }}
+      - name: Vet
+        run: go vet ./...
+      - name: Run tests
+        run: go test -race -timeout 10m ./...
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rio_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version: 'stable'
+      - name: Run tests against PostgreSQL
+        run: go test -race -timeout 10m ./...
+        env:
+          RIO_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/rio_test?sslmode=disable
