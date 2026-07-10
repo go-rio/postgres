@@ -86,13 +86,19 @@ func NewFromPool(pool *pgxpool.Pool, opts ...rio.Option) *rio.DB {
 	return db
 }
 
-// PoolOf returns the pgxpool.Pool behind a *rio.DB built by OpenPool or
-// NewFromPool, and nil for every other construction (Open and New manage no
-// pool). It is the door to what the pool alone can do: Ping, Stat,
-// AcquireFunc, CopyFrom, LISTEN/NOTIFY.
+// PoolOf returns the pgxpool.Pool behind a *rio.DB built by OpenPool,
+// NewFromPool, OpenNative, or NewNativeFromPool, and nil for every other
+// construction (Open and New manage no pool). It is the door to what the
+// pool alone can do: Ping, Stat, AcquireFunc, CopyFrom, LISTEN/NOTIFY.
 func PoolOf(db *rio.DB) *pgxpool.Pool {
 	if db == nil {
 		return nil
+	}
+	// The native channel carries its pool as the DB's native handle; the
+	// pgx-pool-over-database/sql tier predates that slot and keeps its
+	// package-local registry.
+	if pool, ok := db.Native().(*pgxpool.Pool); ok {
+		return pool
 	}
 	pools.RLock()
 	defer pools.RUnlock()

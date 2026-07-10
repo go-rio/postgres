@@ -1,11 +1,13 @@
 // Package postgres connects github.com/go-rio/rio to PostgreSQL through the
-// pgx driver's database/sql adapter.
+// pgx driver — via its database/sql adapter (Open, OpenPool) or fully
+// natively (OpenNative, the fastest read path; see the README's tier table).
 //
 // The package is deliberately thin: it constructs a *rio.DB with the built-in
 // rio.Postgres dialect, installs a precise error translator that maps
-// *pgconn.PgError values onto rio's sentinel errors, and keeps the connection
-// settings honest about standard_conforming_strings. All SQL grammar lives in
-// the rio core; this module never shapes a query.
+// *pgconn.PgError values onto rio's sentinel errors, keeps the connection
+// settings honest about standard_conforming_strings, and adapts pgx to rio's
+// native-channel SPI. All SQL grammar lives in the rio core; this module
+// never shapes a query.
 package postgres
 
 import (
