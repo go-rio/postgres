@@ -42,8 +42,43 @@ if errors.Is(err, rio.ErrDuplicateKey) {
 ```
 
 The DSN is handed to pgx untouched: URL form, keyword/value form, and every
-pgx runtime parameter all work. `Open` validates the DSN but does not
-connect; ping `db.Unwrap()` to check connectivity eagerly.
+pgx runtime parameter all work — with one exception, described in the next
+section. `Open` validates the DSN but does not connect; ping `db.Unwrap()`
+to check connectivity eagerly.
+
+## standard_conforming_strings
+
+rio rewrites `?` placeholders by lexing your SQL the way a stock PostgreSQL
+server does: with `standard_conforming_strings=on` — the default since
+PostgreSQL 9.1 — a backslash inside a `'...'` literal is an ordinary
+character. Turning the setting off makes the server treat backslash as an
+escape character again, so a literal in your SQL could hide or expose a `?`
+differently on each side and the placeholder count would diverge (rio fails
+loudly with an arity error rather than sending a misbound query). The
+setting is therefore not supported. `Open` keeps the invariant the same way
+the mysql sibling pins `sql_mode`:
+
+- The setting is never mentioned → nothing is injected; the session uses
+  the server's value, which is `on` unless an operator changed it.
+- The DSN — or the `PGOPTIONS` environment variable, which pgx also reads —
+  turns it off, either directly (`standard_conforming_strings=off`) or
+  through the `options` startup parameter
+  (`options=-c standard_conforming_strings=off`) → `Open` returns an error
+  naming the setting.
+- An explicit `on` is redundant but harmless and passes through.
+
+If your server turns the setting off globally, turn it back on for rio's
+connections in the DSN (URL form, `%20` is a space and `%3D` is `=`):
+
+```text
+postgres://user:pass@localhost:5432/app?options=-c%20standard_conforming_strings%3Don
+```
+
+or in keyword/value form:
+
+```text
+host=localhost dbname=app options='-c standard_conforming_strings=on'
+```
 
 ## Bring your own pool
 
@@ -59,7 +94,9 @@ db := postgres.New(stdlib.OpenDBFromPool(pool))
 ```
 
 Pool tuning (`SetMaxOpenConns` and friends) happens on the `*sql.DB`; rio
-never replaces or configures the connection pool.
+never replaces or configures the connection pool. `New` performs no
+connection hygiene either — keeping `standard_conforming_strings` on (see
+above) is on you.
 
 ## PgBouncer
 

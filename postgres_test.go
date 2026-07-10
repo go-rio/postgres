@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,137 @@ func TestOpenInvalidDSN(t *testing.T) {
 	}
 	if !strings.HasPrefix(err.Error(), "postgres: open:") {
 		t.Errorf("error %q should carry the package prefix", err)
+	}
+}
+
+func TestOpenRejectsNonConformingStrings(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+	}{
+		{"URL parameter",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=off"},
+		{"keyword/value form",
+			"host=localhost dbname=app standard_conforming_strings=off"},
+		{"spelled false",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=false"},
+		{"spelled 0",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=0"},
+		// The server's parse_bool accepts any unique prefix of its
+		// spellings; "f" is false.
+		{"parse_bool prefix",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=f"},
+		{"upper-case value",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=OFF"},
+		{"upper-case parameter name",
+			"postgres://user:pass@localhost:5432/app?Standard_Conforming_Strings=off"},
+		{"options -c",
+			"host=localhost dbname=app options='-c standard_conforming_strings=off'"},
+		{"options -c abutting its argument",
+			"postgres://user:pass@localhost/app?options=-cstandard_conforming_strings%3Doff"},
+		{"options long form, dashes for underscores",
+			"postgres://user:pass@localhost/app?options=--standard-conforming-strings%3Doff"},
+		{"options among unrelated settings",
+			"host=localhost dbname=app options='-c search_path=public -c standard_conforming_strings=off'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := Open(tt.dsn)
+			if err == nil {
+				_ = db.Close()
+				t.Fatalf("Open(%q) accepted standard_conforming_strings=off", tt.dsn)
+			}
+			if !strings.Contains(err.Error(), "standard_conforming_strings") {
+				t.Errorf("Open(%q) error %q does not name standard_conforming_strings", tt.dsn, err)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsNonConformingStringsFromPGOPTIONS(t *testing.T) {
+	// pgx reads the PGOPTIONS environment variable into the options startup
+	// parameter, so the check must catch that route too.
+	t.Setenv("PGOPTIONS", "-c standard_conforming_strings=off")
+	db, err := Open("postgres://user:pass@localhost:5432/app")
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open accepted standard_conforming_strings=off from PGOPTIONS")
+	}
+	if !strings.Contains(err.Error(), "standard_conforming_strings") {
+		t.Errorf("Open error %q does not name standard_conforming_strings", err)
+	}
+}
+
+func TestOpenAllowsConformingStrings(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+	}{
+		{"setting never mentioned",
+			"postgres://user:pass@localhost:5432/app"},
+		{"explicit on",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=on"},
+		{"explicit true",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=true"},
+		{"explicit 1",
+			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=1"},
+		{"unrelated options settings",
+			"host=localhost dbname=app options='-c search_path=public'"},
+		{"options turning it on",
+			"host=localhost dbname=app options='-c standard_conforming_strings=on'"},
+		// parse_bool treats a lone "o" as ambiguous and anything unknown as
+		// invalid; the server refuses such a startup value itself, loudly —
+		// not ours to second-guess.
+		{"ambiguous o passes through",
+			"postgres://user:pass@localhost/app?standard_conforming_strings=o"},
+		{"invalid value passes through",
+			"postgres://user:pass@localhost/app?standard_conforming_strings=banana"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := Open(tt.dsn)
+			if err != nil {
+				t.Fatalf("Open(%q): %v", tt.dsn, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		})
+	}
+}
+
+func TestPgFalse(t *testing.T) {
+	falses := []string{"off", "of", "OFF", "f", "fa", "fal", "fals", "false", "FALSE", "n", "no", "No", "0"}
+	for _, v := range falses {
+		if !pgFalse(v) {
+			t.Errorf("pgFalse(%q) = false, want true", v)
+		}
+	}
+	notFalses := []string{"", "on", "true", "t", "1", "y", "yes", "o", "banana", "00", "falsey", "noo", "offf"}
+	for _, v := range notFalses {
+		if pgFalse(v) {
+			t.Errorf("pgFalse(%q) = true, want false", v)
+		}
+	}
+}
+
+func TestSplitServerOptions(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"-c a=1 -c b=2", []string{"-c", "a=1", "-c", "b=2"}},
+		{"  -c  a=1\t--b=2 ", []string{"-c", "a=1", "--b=2"}},
+		// A backslash escapes the next byte, the server's pg_split_opts rule
+		// that keeps escaped spaces inside a single argument.
+		{`-c search_path=a\ b`, []string{"-c", "search_path=a b"}},
+		{`a\\b`, []string{`a\b`}},
+		{"", nil},
+	}
+	for _, tt := range tests {
+		if got := splitServerOptions(tt.in); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("splitServerOptions(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
