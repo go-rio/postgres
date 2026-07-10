@@ -68,6 +68,11 @@ Behind PgBouncer in transaction or statement pooling mode, keep
 `default_query_exec_mode=exec` to the DSN, because server-side prepared
 statements do not survive connection multiplexing.
 
+Talking to PostgreSQL directly, leave `rio.WithStmtCache` off too: pgx
+already caches prepared statements per connection in its default query exec
+mode, and stacking `database/sql`'s statement layer on top measured slower,
+not faster, in rio's bench suite.
+
 ## The rio family
 
 [rio](https://github.com/go-rio/rio) — the ORM ·
