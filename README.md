@@ -1,10 +1,9 @@
 # postgres
 
-[![Doc](https://pkg.go.dev/badge/github.com/go-rio/postgres)](https://pkg.go.dev/github.com/go-rio/postgres)
+[![Doc](https://pkg.go.dev/badge/github.com/go-rio/postgres.svg)](https://pkg.go.dev/github.com/go-rio/postgres)
 [![Go](https://img.shields.io/github/go-mod/go-version/go-rio/postgres)](https://go.dev/)
 [![Release](https://img.shields.io/github/release/go-rio/postgres.svg)](https://github.com/go-rio/postgres/releases)
-[![Test](https://github.com/go-rio/postgres/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/postgres/actions)
-[![Report Card](https://goreportcard.com/badge/github.com/go-rio/postgres)](https://goreportcard.com/report/github.com/go-rio/postgres)
+[![Test](https://github.com/go-rio/postgres/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/postgres/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/postgres)](https://opensource.org/license/MIT)
 
 PostgreSQL driver module for [rio](https://github.com/go-rio/rio), the Go ORM,
@@ -188,6 +187,84 @@ On the database/sql tiers behind PgBouncer, keep `rio.WithStmtCache` off (the
 default) and apply the same DSN matrix. Against PostgreSQL directly, leave it
 off too: pgx already caches prepared statements per connection, and stacking
 database/sql's statement layer on top measured slower in rio's bench suite.
+
+## Arrays and JSONB
+
+PostgreSQL's rich column types map through rio with no dialect-specific API.
+
+**JSONB.** Tag a field `rio:",json"` and rio (de)serializes it with
+`encoding/json` on every write and read — any Go value, no wrapper type and no
+manual `[]byte`:
+
+```go
+type Account struct {
+	ID    int64
+	Prefs map[string]any `rio:",json"` // jsonb column "prefs"
+}
+```
+
+A set-based write goes the same way: `rio.Set{"prefs": v}` marshals `v` as
+JSON, because `prefs` is a json column.
+
+**Arrays.** rio binds a field through any `driver.Valuer` and scans it back
+through any `sql.Scanner`, so an array column is a small wrapper type. pgx
+ships `pgtype.Array[T]`/`FlatArray[T]`, but they do **not** implement those two
+`database/sql` interfaces directly — pgtype's own `Map.SQLScanner` doc notes
+they "need assistance from Map to implement the sql.Scanner interface". So the
+wrapper delegates (de)serialization to a `*pgtype.Map` instead of building the
+`{...}` literal by hand (element quoting and escaping are easy to get wrong):
+
+```go
+import (
+	"database/sql/driver"
+
+	"github.com/jackc/pgx/v5/pgtype"
+)
+
+var pgMap = pgtype.NewMap()
+
+type Tags []string // maps a text[] column
+
+func (t Tags) Value() (driver.Value, error) {
+	b, err := pgMap.Encode(pgtype.TextArrayOID, pgtype.TextFormatCode,
+		pgtype.FlatArray[string](t), nil)
+	if err != nil || b == nil { // b == nil ⇒ nil/NULL
+		return nil, err
+	}
+	return string(b), nil
+}
+
+func (t *Tags) Scan(src any) error {
+	return pgMap.SQLScanner((*pgtype.FlatArray[string])(t)).Scan(src)
+}
+```
+
+`Encode` renders `Tags{"a", "b,c"}` to the literal `{a,"b,c"}` (pgx quotes the
+embedded comma); `Scan` parses it back. Declare the field as usual — a `Tags`
+field with a `rio:"labels"` tag — and it binds and scans on the `Open`/`OpenPool`
+tiers; pgx recognizes the same `driver.Valuer`/`sql.Scanner` on `OpenNative` too.
+
+**JSONB operators that contain `?`.** The existence operators `?`, `?|`, and
+`?&` collide with rio's `?` placeholder. Double each literal `?`: rio's
+rebinder collapses `??` to a single `?` and consumes no argument, so
+
+```go
+rio.From[Account]().Where("prefs ?? ?", "beta").All(ctx, db)
+```
+
+is sent as `prefs ? $1` with one bind (`"beta"`); `?|` and `?&` are written
+`??|` and `??&`.
+
+**Bulk-updating an array column.** `UpdateAll` renders `SET col = ?`, and the
+rebinder will not expand a bare slice there (that would emit the malformed
+`SET col = ?, ?`). Passing one is a deliberate error:
+
+```
+rio: UpdateAll: column "labels" value is a slice, which SET cannot expand; wrap it in a driver.Valuer (e.g. pq.Array) or use rio.Expr
+```
+
+Wrap the slice in the `Valuer` type above — `rio.Set{"labels": Tags{"a", "b"}}`
+— or pass a `rio.Expr` for a database-side expression.
 
 ## The rio family
 
