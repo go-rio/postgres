@@ -1,8 +1,8 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/go-rio/rio v0.8.0 h1:paey1xU+1NglihZYPuMWIkXo86BoIGXFIF3j69xIxFI=
-github.com/go-rio/rio v0.8.0/go.mod h1:73ZQ/YRw/2l0DHKdlTZqhjEiICFZo4JEPp0zTFI4Ndk=
+github.com/go-rio/rio v0.9.0 h1:y7dFuD29m5gtb/AIKAHMozsSyJn3Ug4pfO98MwS0pVU=
+github.com/go-rio/rio v0.9.0/go.mod h1:73ZQ/YRw/2l0DHKdlTZqhjEiICFZo4JEPp0zTFI4Ndk=
 github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
 github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
 github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
