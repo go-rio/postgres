@@ -287,8 +287,8 @@ func (r *nativeRows) translate(dest []any) {
 		// typed route is Int64Scanner, which refuses the upper half of
 		// uint64's range, while the stdlib channel receives numeric as a
 		// decimal string and accepts it. The fallback delivers that same
-		// string. (bigint cannot hold those values, so numeric is the one
-		// column type where the channels could have split.)
+		// string; bigint cannot hold those values, so numeric is the only
+		// such column type.
 		if kind == rio.NativeKindUint && int(fds[i].DataTypeOID) == pgtype.NumericOID {
 			kind = rio.NativeKindScanner
 		}
@@ -317,11 +317,10 @@ func (r *nativeRows) translate(dest []any) {
 	r.dests = out
 }
 
-// The per-kind cells. Each implements exactly one pgtype scanner interface
-// (timeCell: the three time-shaped ones) and forwards unboxed values into
-// the rio cell's typed sinks; NULL forwards to SetNull, where rio's own NULL
-// rules (pointer nil-out, softdelete zero time, loud errors) live. Scan is
-// the shared fallback for every column type without a typed route.
+// The per-kind cells forward unboxed values into the rio cell's typed sinks;
+// NULL forwards to SetNull, where rio's own NULL rules (pointer nil-out,
+// softdelete zero time, loud errors) live. Scan is the shared fallback for
+// every column type without a typed route.
 
 type intCell struct{ c rio.NativeCell }
 
