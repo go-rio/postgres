@@ -52,7 +52,7 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 		return nil, fmt.Errorf("postgres: open: %w", err)
 	}
 	if bad := nonConformingStringsSetting(cfg.RuntimeParams); bad != "" {
-		return nil, fmt.Errorf("postgres: open: the connection settings turn standard_conforming_strings off (%s), but rio rewrites ? placeholders assuming it is on — the server default since PostgreSQL 9.1, under which backslash is an ordinary character inside '...' literals — so the server would lex string literals differently from rio and the two could disagree on the placeholder count; remove the setting or set it to on", bad)
+		return nil, errNonConformingStrings("open", bad)
 	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -78,6 +78,13 @@ func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	merged = append(merged, rio.WithErrorTranslator(translate))
 	merged = append(merged, opts...)
 	return rio.New(db, rio.Postgres, merged...)
+}
+
+// errNonConformingStrings is the shared refusal for a configuration that
+// turns standard_conforming_strings off, worded once for every constructor
+// that can see the settings (Open and OpenPool).
+func errNonConformingStrings(op, bad string) error {
+	return fmt.Errorf("postgres: %s: the connection settings turn standard_conforming_strings off (%s), but rio rewrites ? placeholders assuming it is on — the server default since PostgreSQL 9.1, under which backslash is an ordinary character inside '...' literals — so the server would lex string literals differently from rio and the two could disagree on the placeholder count; remove the setting or set it to on", op, bad)
 }
 
 // nonConformingStringsSetting returns a description of the connection

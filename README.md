@@ -80,23 +80,46 @@ or in keyword/value form:
 host=localhost dbname=app options='-c standard_conforming_strings=on'
 ```
 
-## Bring your own pool
+## Choosing a constructor
 
-`New` wraps any `*sql.DB` you already manage — including one derived from a
-`pgxpool.Pool`:
+Two tiers today, each with a bring-your-own variant; DAO code is identical
+on both, and moving between them is a one-line constructor swap.
+
+| Tier | Constructors | What you get |
+|---|---|---|
+| database/sql | `Open` · `New` | The default. database/sql manages connections, so everything in that ecosystem — `sqlmock`, otelsql wrappers, your own `*sql.DB` tuning — plugs in unchanged. |
+| pgx pool | `OpenPool` · `NewFromPool` | Same query semantics, pgxpool manages connections: health checks, connection lifetime and idle caps, `AfterConnect`, `Stat()` metrics — and `PoolOf(db)` opens the door to `CopyFrom` and `LISTEN`. Measured performance-neutral next to `Open`; choose it for the pool, not for speed. |
+
+## The pgx pool tier
+
+`OpenPool` parses the DSN with `pgxpool.ParseConfig` — every `Open` DSN
+works, plus pgxpool's `pool_*` parameters (`pool_max_conns`,
+`pool_min_conns`, `pool_max_conn_lifetime`, `pool_max_conn_idle_time`,
+`pool_health_check_period`) — and applies the same
+`standard_conforming_strings` guard:
 
 ```go
-pool, err := pgxpool.New(ctx, dsn)
+db, err := postgres.OpenPool(ctx, "postgres://user:pass@localhost:5432/app?pool_max_conns=10")
 if err != nil {
 	log.Fatal(err)
 }
-db := postgres.New(stdlib.OpenDBFromPool(pool))
+defer db.Close() // closes the database/sql view, then the pool
+
+pool := postgres.PoolOf(db)    // *pgxpool.Pool: Ping, Stat, CopyFrom, LISTEN
+err = pool.Ping(ctx)           // OpenPool validates but never connects
 ```
 
-Pool tuning (`SetMaxOpenConns` and friends) happens on the `*sql.DB`; rio
-never replaces or configures the connection pool. `New` performs no
-connection hygiene either — keeping `standard_conforming_strings` on (see
-above) is on you.
+`NewFromPool` wraps a pool you built from your own `pgxpool.Config`
+(tracers, `AfterConnect`, `MinConns`, a custom query exec mode). Like `New`
+taking over the `*sql.DB`, both constructors take over the pool's `Close`:
+closing the rio handle closes the pool, blocking until acquired connections
+are returned; a further `pool.Close()` of your own is a harmless no-op. Keep
+a pool out of `NewFromPool` if it must outlive the rio.DB.
+
+Connection counts belong to the pgxpool configuration on this tier — leave
+`SetMaxOpenConns`/`SetMaxIdleConns` off `db.Unwrap()`. The view keeps zero
+idle database/sql connections (pgx's documented requirement), so an idle
+view connection never pins a pool connection away from direct pool users.
 
 ## PgBouncer
 
