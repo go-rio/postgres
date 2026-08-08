@@ -6,27 +6,17 @@
 [![Test](https://github.com/go-rio/postgres/actions/workflows/test.yml/badge.svg)](https://github.com/go-rio/postgres/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/go-rio/postgres)](https://opensource.org/license/MIT)
 
-PostgreSQL driver module for [rio](https://github.com/go-rio/rio), the Go ORM,
-built on [pgx](https://github.com/jackc/pgx). Runs through the pgx database/sql
-adapter by default, or fully natively (`OpenNative`) for the fastest read path.
+PostgreSQL driver module for [rio](https://github.com/go-rio/rio), built on
+[pgx](https://github.com/jackc/pgx). It supports database/sql, database/sql over
+pgxpool, and direct pgx execution.
 
-It provides constructors, eager DSN validation, the pgx-native execution
-channel, and an error translator that maps `*pgconn.PgError` onto rio
-sentinels, keeping the original pgx error in the chain for `errors.As`. SQL
-rendering stays in the rio core.
-
-| SQLSTATE | rio sentinel |
-|---|---|
-| 23505 | `rio.ErrDuplicateKey` |
-| 23503 | `rio.ErrForeignKeyViolated` |
-
-## Install
+## Getting started
 
 ```sh
 go get github.com/go-rio/postgres
 ```
 
-## Usage
+The default path uses `database/sql`:
 
 ```go
 db, err := postgres.Open("postgres://user:pass@localhost:5432/app")
@@ -35,166 +25,146 @@ if err != nil {
 }
 defer db.Close()
 
-err = rio.Insert(ctx, db, &user) // RETURNING fills the whole row back
+if err := db.Unwrap().PingContext(ctx); err != nil {
+	log.Fatal(err)
+}
 
-if errors.Is(err, rio.ErrDuplicateKey) {
-	var pgErr *pgconn.PgError
-	errors.As(err, &pgErr) // constraint name, table, detail preserved
+if err := rio.Insert(ctx, db, &user); err != nil {
+	log.Fatal(err)
 }
 ```
 
-- The DSN is passed to pgx untouched: URL form, keyword/value form, and every
-  pgx runtime parameter, except `standard_conforming_strings=off` (below).
-- `Open` validates the DSN without connecting; ping `db.Unwrap()` to check
-  connectivity eagerly.
+`Open` validates the DSN but does not connect. It accepts pgx URL and
+keyword/value DSNs. Use `New` to wrap an existing `*sql.DB`; the caller remains
+responsible for its session configuration.
+
+### Error translation
+
+| SQLSTATE | rio sentinel |
+|---|---|
+| 23505 | `rio.ErrDuplicateKey` |
+| 23503 | `rio.ErrForeignKeyViolated` |
+
+The original `*pgconn.PgError` remains available through `errors.As`, including
+its constraint, table, and detail fields.
+
+## Choosing an execution path
+
+rio queries use the same API on all three paths. Choose based on connection
+ownership and access to pgx APIs.
+
+| Path | Constructors | Use when |
+|---|---|---|
+| database/sql | `Open`, `New` | You want `*sql.DB` pooling, sqlmock, or database/sql instrumentation. |
+| database/sql over pgxpool | `OpenPool`, `NewFromPool` | You want pgxpool configuration and `PoolOf`, while keeping the database/sql query path. |
+| native pgx | `OpenNative`, `NewNativeFromPool` | You want lower scan allocations and can use pgx execution-mode and transaction semantics. |
 
 ## standard_conforming_strings
 
-rio rewrites `?` placeholders assuming `standard_conforming_strings=on` (the
-default since PostgreSQL 9.1), where backslash inside a `'...'` literal is
-ordinary. Turned off, backslash becomes an escape character, so rio and the
-server can disagree on the placeholder count; rio fails with an arity error,
-not a misbound query. The setting is unsupported, as the mysql sibling pins
-`sql_mode`.
+rio's PostgreSQL placeholder lexer requires `standard_conforming_strings=on`,
+the PostgreSQL default since 9.1. `Open`, `OpenPool`, and `OpenNative` reject an
+explicit false value supplied directly, through the `options` startup
+parameter, or through `PGOPTIONS`.
 
-| DSN state | Result |
-|---|---|
-| Not mentioned | Nothing injected; the session uses the server value (`on` unless an operator changed it). |
-| `on`, explicit | Redundant but harmless; passes through. |
-| Off — directly (`standard_conforming_strings=off`), via the `options` startup parameter (`options=-c standard_conforming_strings=off`), or via `PGOPTIONS` (pgx also reads it) | `Open` returns an error naming the setting. |
-
-Re-enable per connection when the server disables it globally (URL form,
-`%20` is a space, `%3D` is `=`):
+If omitted, rio does not inject the setting. Servers that disable it globally
+must enable it for rio connections:
 
 ```text
 postgres://user:pass@localhost:5432/app?options=-c%20standard_conforming_strings%3Don
 ```
 
-Keyword/value form:
+Keyword/value DSNs can use
+`options='-c standard_conforming_strings=on'` instead.
 
-```text
-host=localhost dbname=app options='-c standard_conforming_strings=on'
-```
+The bring-your-own constructors cannot validate an existing pool's session
+settings; callers of `New`, `NewFromPool`, and `NewNativeFromPool` must enforce
+this requirement.
 
-## Choosing a constructor
-
-Three tiers, each with a bring-your-own variant. DAO code is identical across
-tiers; switching is a one-line constructor swap.
-
-| Tier | Constructors | Notes |
-|---|---|---|
-| database/sql | `Open` · `New` | Default. database/sql manages connections, so `sqlmock`, otelsql wrappers, and `*sql.DB` tuning plug in unchanged. |
-| pgx pool | `OpenPool` · `NewFromPool` | Same query semantics; pgxpool manages connections (health checks, connection lifetime and idle caps, `AfterConnect`, `Stat()` metrics). `PoolOf(db)` exposes `CopyFrom` and `LISTEN`. Measured performance-neutral next to `Open`. |
-| pgx native | `OpenNative` · `NewNativeFromPool` | Fastest channel: queries run on pgx directly, no `driver.Value` boxing. Same SQL, scanning rules, errors, hooks, and savepoints. Loopback median-of-3: 100-row read 433→124 allocs/op (−71%, −20% bytes), single-row 30→18, Insert 19→14, Update 9→6. pgx semantics apply: exec mode comes from the DSN, and `TxOf(tx)` replaces `tx.Unwrap()` in transactions. |
-
-## The pgx pool tier
-
-`OpenPool` parses the DSN with `pgxpool.ParseConfig`: every `Open` DSN plus
-pgxpool `pool_*` parameters (`pool_max_conns`, `pool_min_conns`,
-`pool_max_conn_lifetime`, `pool_max_conn_idle_time`,
-`pool_health_check_period`). The `standard_conforming_strings` guard still
-applies.
+## pgxpool with database/sql
 
 ```go
 db, err := postgres.OpenPool(ctx, "postgres://user:pass@localhost:5432/app?pool_max_conns=10")
 if err != nil {
 	log.Fatal(err)
 }
-defer db.Close() // closes the database/sql view, then the pool
+defer db.Close()
 
-pool := postgres.PoolOf(db)    // *pgxpool.Pool: Ping, Stat, CopyFrom, LISTEN
-err = pool.Ping(ctx)           // OpenPool validates but never connects
+pool := postgres.PoolOf(db)
+if err := pool.Ping(ctx); err != nil {
+	log.Fatal(err)
+}
 ```
 
-- `NewFromPool` wraps a pool built from your own `pgxpool.Config` (tracers,
-  `AfterConnect`, `MinConns`, a custom query exec mode).
-- Both constructors take over the pool's `Close` (as `New` does for `*sql.DB`):
-  closing the rio handle closes the pool, blocking until acquired connections
-  return; a later `pool.Close()` is a no-op. Keep a pool out of `NewFromPool`
-  if it must outlive the rio.DB.
-- Connection counts belong to the pgxpool config here; leave
-  `SetMaxOpenConns`/`SetMaxIdleConns` off `db.Unwrap()`. The view holds zero
-  idle database/sql connections (pgx's documented requirement), so an idle
-  view connection never pins a pool connection away from direct pool users.
+- `OpenPool` accepts pgxpool `pool_*` DSN parameters. Use `NewFromPool` for a
+  caller-built `pgxpool.Config`.
+- `PoolOf` exposes the pool for `Ping`, `Stat`, `AcquireFunc`, `CopyFrom`, and
+  `LISTEN/NOTIFY`.
+- `OpenPool` and `NewFromPool` transfer pool ownership to the rio DB. Closing
+  the DB closes the pool and may block until acquired connections return. Do
+  not transfer a pool that must outlive the DB.
+- Configure connection counts on pgxpool, not on `db.Unwrap()`. The
+  database/sql view intentionally keeps no idle connections.
 
-## The native tier
+## Native pgx execution
 
-`OpenNative` builds the same pgxpool as `OpenPool`, then skips database/sql:
-rendered SQL goes straight to pgx, and decoded values flow through pgtype's
-typed scanner interfaces into rio's scan cells with no boxing.
+`OpenNative` executes rio queries directly through pgx. `db.Unwrap()` remains
+available as a database/sql view for helpers such as migrations and pings, but
+must not be used to configure pooling.
 
 ```go
 db, err := postgres.OpenNative(ctx, "postgres://user:pass@localhost:5432/app")
 if err != nil {
 	log.Fatal(err)
 }
-defer db.Close() // closes the database/sql view, then the pool
+defer db.Close()
 
-pool := postgres.PoolOf(db)      // the pgxpool: Ping, Stat, CopyFrom, LISTEN
+pool := postgres.PoolOf(db)
+if err := pool.Ping(ctx); err != nil {
+	log.Fatal(err)
+}
 err = db.Tx(ctx, func(tx *rio.Tx) error {
-	ptx := postgres.TxOf(tx)     // the pgx.Tx behind this transaction
-	_ = ptx                      // CopyFrom inside the transaction, etc.
-	return nil
+	ptx := postgres.TxOf(tx)
+	_, err := ptx.Exec(ctx, "SET LOCAL lock_timeout = '1s'")
+	return err
 })
 ```
 
-Contracts hold as on the other tiers: same rendered SQL, scanning rules (NULL
-handling, overflow checks, `[]byte` copying), sentinel errors, `QueryHook`
-events, savepoint choreography, and `errors.Is(err, context.Canceled)` on
-cancellation. The full integration suite runs twice in CI, once per channel.
-Three differences:
+`NewNativeFromPool` accepts a caller-built pool and transfers ownership to the
+rio DB. Closing the DB closes its database/sql view first and then the pool,
+and may block until acquired connections return.
+
+The native path preserves rio's SQL rendering, scanning rules, sentinel
+errors, hooks, and savepoint behavior. Its public differences are:
 
 | Difference | Detail |
 |---|---|
-| `tx.Unwrap()` returns nil in transactions | No `*sql.Tx` exists here; use `postgres.TxOf(tx)` for the `pgx.Tx`. `db.Unwrap()` still returns a database/sql view over the same pool for pool-agnostic helpers (pings, migrations); do not tune pooling on it. |
-| `rio.WithStmtCache` panics at construction | Statement caching belongs to pgx's query exec mode here, not to an absent database/sql layer. |
-| Error text can carry pgx prefixes | Affects timeouts and scan errors. `errors.Is`/`errors.As` contracts are identical; only prose differs. |
+| `tx.Unwrap()` returns nil | Use `postgres.TxOf(tx)` for the `pgx.Tx`. Nested rio savepoints expose the root pgx transaction. |
+| `rio.WithStmtCache` panics | Native statement caching belongs to pgx's query execution mode. |
+| Error text may carry pgx prefixes | Use `errors.Is` and `errors.As` for stable checks. |
 
-Benchmarks (Apple M4, loopback PostgreSQL 17, `bench/bench_pg_test.go`, median
-of 3; real networks shrink the latency share, but the allocation savings are
-CPU-side and stay):
-
-| shape | rio (stdlib) | rio (native) | hand-written database/sql | GORM |
-|---|---|---|---|---|
-| read 1 row | 30 allocs · 1.3 KB | **18 allocs · 1.0 KB** | 30 allocs · 1.3 KB | 82 allocs · 6.5 KB |
-| read 100 rows | 433 allocs · 33 KB | **124 allocs · 27 KB** | 532 allocs · 41 KB | 1172 allocs · 59 KB |
-| insert | 19 allocs | **14 allocs** | 20 allocs | 93 allocs |
-| update | 9 allocs | **6 allocs** | 7 allocs | 93 allocs |
-
-pgx's own `pgx.CollectRows[T]` costs ~316 allocs on the 100-row shape — the
-native channel beats even that helper.
+The native path removes the `database/sql` conversion layer. Use
+[rio's PostgreSQL benchmarks](https://github.com/go-rio/rio/blob/main/bench/bench_pg_test.go)
+to compare both paths against the application workload.
 
 ## Query exec mode and PgBouncer
 
-The native tier uses pgx's default execution mode,
-`QueryExecModeCacheStatement`: statements are prepared and cached per
-connection automatically. rio never downgrades it. Change it in the DSN
-(`?default_query_exec_mode=exec`, `simple_protocol`, `cache_describe`, …) or on
-your own `pgxpool.Config` via `NewNativeFromPool`.
+The native path uses pgx's default `cache_statement` mode. Change it with the
+`default_query_exec_mode` DSN parameter or on a caller-built pool config.
 
 | Setup | Action |
 |---|---|
-| Direct connection | None; the default (`cache_statement`) is the fast path. |
+| Direct connection | Keep the pgx default. |
 | PgBouncer ≥ 1.21 with `max_prepared_statements > 0` | None; PgBouncer tracks prepared statements across the multiplexer. |
 | Older PgBouncer in transaction/statement pooling | Add `default_query_exec_mode=exec` (or `simple_protocol`) to the DSN. Symptom otherwise: `prepared statement "stmtcache_..." does not exist`. |
 
-DDL note: under `cache_statement`, changing a table's shape invalidates cached
-plans; pgx detects `cached plan must not change result type`, invalidates, and
-retries read queries itself. On the database/sql tiers, rio's `WithStmtCache`
-eviction handles the same case — it evicts and propagates, never retries.
-
-On the database/sql tiers behind PgBouncer, keep `rio.WithStmtCache` off (the
-default) and apply the same DSN matrix. Against PostgreSQL directly, leave it
-off too: pgx already caches prepared statements per connection, and stacking
-database/sql's statement layer on top measured slower in rio's bench suite.
+On database/sql paths, `rio.WithStmtCache` adds a DB-level cache and a cache
+local to each transaction. It is off by default and is unsuitable for
+transaction/statement-mode poolers. pgx already caches statements per
+connection, so enable the additional rio cache only after measuring it.
 
 ## Arrays and JSONB
 
-PostgreSQL's rich column types map through rio with no dialect-specific API.
-
-**JSONB.** Tag a field `rio:",json"` and rio (de)serializes it with
-`encoding/json` on every write and read — any Go value, no wrapper type and no
-manual `[]byte`:
+Tag JSON fields with `rio:",json"`:
 
 ```go
 type Account struct {
@@ -203,32 +173,24 @@ type Account struct {
 }
 ```
 
-A set-based write goes the same way: `rio.Set{"prefs": v}` marshals `v` as
-JSON, because `prefs` is a json column.
+A set-based `rio.Set{"prefs": v}` uses the same JSON mapping.
 
-**Arrays.** rio binds a field through any `driver.Valuer` and scans it back
-through any `sql.Scanner`, so an array column is a small wrapper type. pgx
-ships `pgtype.Array[T]`/`FlatArray[T]`, but they do **not** implement those two
-`database/sql` interfaces directly — pgtype's own `Map.SQLScanner` doc notes
-they "need assistance from Map to implement the sql.Scanner interface". So the
-wrapper delegates (de)serialization to a `*pgtype.Map` instead of building the
-`{...}` literal by hand (element quoting and escaping are easy to get wrong):
+For PostgreSQL arrays, define a `driver.Valuer` and `sql.Scanner` wrapper around
+pgtype:
 
 ```go
-import (
-	"database/sql/driver"
-
-	"github.com/jackc/pgx/v5/pgtype"
-)
-
 var pgMap = pgtype.NewMap()
 
-type Tags []string // maps a text[] column
+type Tags []string
 
 func (t Tags) Value() (driver.Value, error) {
-	b, err := pgMap.Encode(pgtype.TextArrayOID, pgtype.TextFormatCode,
-		pgtype.FlatArray[string](t), nil)
-	if err != nil || b == nil { // b == nil ⇒ nil/NULL
+	b, err := pgMap.Encode(
+		pgtype.TextArrayOID,
+		pgtype.TextFormatCode,
+		pgtype.FlatArray[string](t),
+		nil,
+	)
+	if err != nil || b == nil {
 		return nil, err
 	}
 	return string(b), nil
@@ -239,41 +201,25 @@ func (t *Tags) Scan(src any) error {
 }
 ```
 
-`Encode` renders `Tags{"a", "b,c"}` to the literal `{a,"b,c"}` (pgx quotes the
-embedded comma); `Scan` parses it back. Declare the field as usual — a `Tags`
-field with a `rio:"labels"` tag — and it binds and scans on the `Open`/`OpenPool`
-tiers; pgx recognizes the same `driver.Valuer`/`sql.Scanner` on `OpenNative` too.
+The wrapper works on all three execution paths.
 
-**JSONB operators that contain `?`.** The existence operators `?`, `?|`, and
-`?&` collide with rio's `?` placeholder. Double each literal `?`: rio's
-rebinder collapses `??` to a single `?` and consumes no argument, so
+JSONB existence operators collide with rio's `?` placeholder. Escape each
+literal question mark as `??`:
 
 ```go
 rio.From[Account]().Where("prefs ?? ?", "beta").All(ctx, db)
 ```
 
-is sent as `prefs ? $1` with one bind (`"beta"`); `?|` and `?&` are written
-`??|` and `??&`.
+This renders `prefs ? $1`; write `?|` and `?&` as `??|` and `??&`.
 
-**Bulk-updating an array column.** `UpdateAll` renders `SET col = ?`, and the
-rebinder will not expand a bare slice there (that would emit the malformed
-`SET col = ?, ?`). Passing one is a deliberate error:
+For `UpdateAll`, wrap an array slice in the `Valuer` type rather than passing a
+bare slice, or use `rio.Expr` for a database-side expression.
 
-```
-rio: UpdateAll: column "labels" value is a slice, which SET cannot expand; wrap it in a driver.Valuer (e.g. pq.Array) or use rio.Expr
-```
+## Contributing
 
-Wrap the slice in the `Valuer` type above — `rio.Set{"labels": Tags{"a", "b"}}`
-— or pass a `rio.Expr` for a database-side expression.
-
-## The rio family
-
-[rio](https://github.com/go-rio/rio) — the ORM ·
-[migrate](https://github.com/go-rio/migrate) — schema migrations as Go code ·
-[sqlite](https://github.com/go-rio/sqlite) / [mysql](https://github.com/go-rio/mysql) —
-the sibling drivers
+Use Go 1.27 or newer, then run `go test ./...`, `go test -race ./...`, and
+`go vet ./...` before opening a pull request.
 
 ## License
 
-The MIT License (MIT). Please see [License File](LICENSE) for more
-information.
+[MIT](LICENSE)

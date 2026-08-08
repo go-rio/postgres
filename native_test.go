@@ -12,9 +12,9 @@ import (
 
 	"github.com/go-rio/rio"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
-
-// --- Unit tests (no server) --------------------------------------------------
 
 func TestOpenNativeInvalidDSN(t *testing.T) {
 	if _, err := OpenNative(context.Background(), "postgres://u@host:not-a-port/db"); err == nil {
@@ -61,13 +61,34 @@ func TestMapTxOptions(t *testing.T) {
 		in   *sql.TxOptions
 		want pgx.TxOptions
 	}{
-		{nil, pgx.TxOptions{}},
-		{&sql.TxOptions{}, pgx.TxOptions{}},
-		{&sql.TxOptions{Isolation: sql.LevelReadUncommitted}, pgx.TxOptions{IsoLevel: pgx.ReadUncommitted}},
-		{&sql.TxOptions{Isolation: sql.LevelReadCommitted}, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}},
-		{&sql.TxOptions{Isolation: sql.LevelRepeatableRead}, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}},
-		{&sql.TxOptions{Isolation: sql.LevelSnapshot}, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}},
-		{&sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true}, pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadOnly}},
+		{in: nil, want: pgx.TxOptions{}},
+		{in: &sql.TxOptions{}, want: pgx.TxOptions{}},
+		{
+			in:   &sql.TxOptions{Isolation: sql.LevelReadUncommitted},
+			want: pgx.TxOptions{IsoLevel: pgx.ReadUncommitted},
+		},
+		{
+			in:   &sql.TxOptions{Isolation: sql.LevelReadCommitted},
+			want: pgx.TxOptions{IsoLevel: pgx.ReadCommitted},
+		},
+		{
+			in:   &sql.TxOptions{Isolation: sql.LevelRepeatableRead},
+			want: pgx.TxOptions{IsoLevel: pgx.RepeatableRead},
+		},
+		{
+			in:   &sql.TxOptions{Isolation: sql.LevelSnapshot},
+			want: pgx.TxOptions{IsoLevel: pgx.RepeatableRead},
+		},
+		{
+			in: &sql.TxOptions{
+				Isolation: sql.LevelSerializable,
+				ReadOnly:  true,
+			},
+			want: pgx.TxOptions{
+				IsoLevel:   pgx.Serializable,
+				AccessMode: pgx.ReadOnly,
+			},
+		},
 	}
 	for _, tc := range cases {
 		got, err := mapTxOptions(tc.in)
@@ -75,14 +96,14 @@ func TestMapTxOptions(t *testing.T) {
 			t.Errorf("mapTxOptions(%+v) = %+v, %v; want %+v", tc.in, got, err, tc.want)
 		}
 	}
-	// The same refusal pgx's database/sql adapter gives.
-	if _, err := mapTxOptions(&sql.TxOptions{Isolation: sql.LevelLinearizable}); err == nil || !strings.Contains(err.Error(), "unsupported isolation") {
+	_, err := mapTxOptions(&sql.TxOptions{Isolation: sql.LevelLinearizable})
+	if err == nil || !strings.Contains(err.Error(), "unsupported isolation") {
 		t.Errorf("unsupported isolation must be refused, got %v", err)
 	}
 }
 
 func TestDoneAsTxDone(t *testing.T) {
-	err := doneAsTxDone(fmt.Errorf("wrapped: %w", pgx.ErrTxClosed))
+	err := doneAsTxDone(fmt.Errorf("wrapped: %w", pgx.ErrTxClosed), false)
 	if !errors.Is(err, sql.ErrTxDone) {
 		t.Fatalf("pgx.ErrTxClosed must translate to sql.ErrTxDone, got %v", err)
 	}
@@ -90,11 +111,133 @@ func TestDoneAsTxDone(t *testing.T) {
 		t.Fatalf("the pgx sentinel must stay in the chain, got %v", err)
 	}
 	other := errors.New("network down")
-	if got := doneAsTxDone(other); got != other {
+	if got := doneAsTxDone(other, false); got != other {
 		t.Fatalf("unrelated errors must pass through, got %v", got)
 	}
-	if doneAsTxDone(nil) != nil {
+	closed := errors.New("connection closed")
+	got := doneAsTxDone(closed, true)
+	if !errors.Is(got, sql.ErrTxDone) || !errors.Is(got, closed) {
+		t.Fatalf("an error from an already closed connection must preserve both errors, got %v", got)
+	}
+	if doneAsTxDone(nil, true) != nil {
 		t.Fatal("nil must stay nil")
+	}
+}
+
+type adapterModel struct {
+	ID     int64
+	Rate   float64
+	Active bool
+	Name   string
+	Blob   []byte
+	At     time.Time
+	Big    uint64
+}
+
+type adapterNativeDB struct{ checked *bool }
+
+func (d adapterNativeDB) Query(context.Context, string, []any) (rio.NativeRows, error) {
+	return &adapterRows{checked: d.checked}, nil
+}
+func (adapterNativeDB) Exec(context.Context, string, []any) (int64, error) { return 0, nil }
+func (adapterNativeDB) Begin(context.Context, *sql.TxOptions) (rio.NativeTx, error) {
+	return nil, errors.New("not used")
+}
+func (adapterNativeDB) Close() error { return nil }
+
+type adapterRows struct {
+	checked *bool
+	pos     int
+}
+
+func (r *adapterRows) Columns() []string {
+	return []string{"id", "rate", "active", "name", "blob", "at", "big"}
+}
+func (r *adapterRows) Next() bool { r.pos++; return r.pos == 1 }
+func (r *adapterRows) Err() error { return nil }
+func (r *adapterRows) Close()     {}
+func (r *adapterRows) Scan(dest ...any) error {
+	fields := []pgconn.FieldDescription{
+		{DataTypeOID: pgtype.Int8OID},
+		{DataTypeOID: pgtype.Float8OID},
+		{DataTypeOID: pgtype.BoolOID},
+		{DataTypeOID: pgtype.TextOID},
+		{DataTypeOID: pgtype.ByteaOID},
+		{DataTypeOID: pgtype.TimestamptzOID},
+		{DataTypeOID: pgtype.NumericOID},
+	}
+	translated := &nativeRows{rows: fieldRows{fields: fields}}
+	translated.translate(dest)
+	if len(translated.cells) != len(dest) || len(translated.dests) != len(dest) {
+		return fmt.Errorf("adapter backing: %d cells, %d dests", len(translated.cells), len(translated.dests))
+	}
+	if translated.dests[0] != (*intCell)(&translated.cells[0]) ||
+		translated.dests[1] != (*floatCell)(&translated.cells[1]) ||
+		translated.dests[2] != (*boolCell)(&translated.cells[2]) ||
+		translated.dests[3] != (*stringCell)(&translated.cells[3]) ||
+		translated.dests[4] != (*bytesCell)(&translated.cells[4]) ||
+		translated.dests[5] != (*timeCell)(&translated.cells[5]) {
+		return errors.New("typed destinations are not views into the shared backing array")
+	}
+	if translated.dests[6] != dest[6] {
+		return errors.New("numeric uint must keep the scanner fallback")
+	}
+	if err := translated.dests[0].(*intCell).ScanInt64(pgtype.Int8{Int64: 7, Valid: true}); err != nil {
+		return err
+	}
+	if err := translated.dests[1].(*floatCell).ScanFloat64(pgtype.Float8{Float64: 1.5, Valid: true}); err != nil {
+		return err
+	}
+	if err := translated.dests[2].(*boolCell).ScanBool(pgtype.Bool{Bool: true, Valid: true}); err != nil {
+		return err
+	}
+	if err := translated.dests[3].(*stringCell).ScanText(pgtype.Text{String: "rio", Valid: true}); err != nil {
+		return err
+	}
+	if err := translated.dests[4].(*bytesCell).ScanBytes([]byte{1, 2, 3}); err != nil {
+		return err
+	}
+	now := time.Date(2026, 8, 2, 1, 2, 3, 0, time.UTC)
+	if err := translated.dests[5].(*timeCell).ScanTimestamptz(pgtype.Timestamptz{Time: now, Valid: true}); err != nil {
+		return err
+	}
+	if err := dest[6].(rio.NativeCell).Scan("18446744073709551615"); err != nil {
+		return err
+	}
+	*r.checked = true
+	return nil
+}
+
+type fieldRows struct{ fields []pgconn.FieldDescription }
+
+func (fieldRows) Close()                                         {}
+func (fieldRows) Err() error                                     { return nil }
+func (fieldRows) CommandTag() pgconn.CommandTag                  { return pgconn.CommandTag{} }
+func (r fieldRows) FieldDescriptions() []pgconn.FieldDescription { return r.fields }
+func (fieldRows) Next() bool                                     { return false }
+func (fieldRows) Scan(...any) error                              { return errors.New("not used") }
+func (fieldRows) Values() ([]any, error)                         { return nil, errors.New("not used") }
+func (fieldRows) RawValues() [][]byte                            { return nil }
+func (fieldRows) Conn() *pgx.Conn                                { return nil }
+
+func TestNativeAdaptersShareBackingArray(t *testing.T) {
+	checked := false
+	db := rio.NewNative(rio.NativeConfig{DB: adapterNativeDB{checked: &checked}}, rio.Postgres)
+	rows, err := rio.From[adapterModel]().All(context.Background(), db)
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if !checked || len(rows) != 1 {
+		t.Fatalf("adapter was not exercised: checked=%v rows=%d", checked, len(rows))
+	}
+	got := rows[0]
+	if got.ID != 7 ||
+		got.Rate != 1.5 ||
+		!got.Active ||
+		got.Name != "rio" ||
+		string(got.Blob) != "\x01\x02\x03" ||
+		got.Big != ^uint64(0) {
+		t.Fatalf("typed adapter values: %+v", got)
 	}
 }
 
@@ -129,14 +272,11 @@ func TestNativeCloseClosesPoolAndView(t *testing.T) {
 	if err := view.PingContext(context.Background()); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("after db.Close() the view should be closed, Ping = %v", err)
 	}
-	// The documented reverse order stays safe: another close is a no-op.
 	pool.Close()
 	if err := db.Close(); err != nil {
 		t.Errorf("repeated Close: %v", err)
 	}
 }
-
-// --- Integration tests (real PostgreSQL, gated by RIO_POSTGRES_DSN) ----------
 
 type nativeProbeUser struct {
 	ID        int64
@@ -203,7 +343,11 @@ func TestNativeIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Find: %v", err)
 		}
-		if got.Email != "n1@x" || got.Age != 30 || string(got.Blob) != "\x01\x02\x03" || got.Note == nil || *got.Note != "hello" {
+		if got.Email != "n1@x" ||
+			got.Age != 30 ||
+			string(got.Blob) != "\x01\x02\x03" ||
+			got.Note == nil ||
+			*got.Note != "hello" {
 			t.Fatalf("round trip lost data: %+v", got)
 		}
 		if !got.CreatedAt.Equal(u.CreatedAt) {
@@ -242,9 +386,6 @@ func TestNativeIntegration(t *testing.T) {
 	})
 
 	t.Run("QueriesBypassTheView", func(t *testing.T) {
-		// Native queries acquire from the pool without touching the
-		// database/sql view: its stats stay at zero open connections after a
-		// query storm.
 		for range 5 {
 			if _, err := rio.Raw[int64]("SELECT 1").All(ctx, db); err != nil {
 				t.Fatalf("Raw: %v", err)
@@ -267,23 +408,29 @@ func TestNativeIntegration(t *testing.T) {
 			if ptx == nil {
 				t.Fatal("TxOf must return the pgx.Tx")
 			}
-			// The pgx.Tx is live and shares the transaction: a native
-			// CopyFrom-style call sees rio's uncommitted write.
 			u := &nativeProbeUser{Email: "sp@x", Age: 7}
 			if err := rio.Insert(ctx, tx, u); err != nil {
 				return err
 			}
 			var n int64
-			if err := ptx.QueryRow(ctx, "SELECT count(*) FROM rio_pg_native_probe_users WHERE email = 'sp@x'").Scan(&n); err != nil {
+			row := ptx.QueryRow(
+				ctx,
+				"SELECT count(*) FROM rio_pg_native_probe_users WHERE email = 'sp@x'",
+			)
+			if err := row.Scan(&n); err != nil {
 				return err
 			}
 			if n != 1 {
 				t.Errorf("TxOf must share the transaction, count = %d", n)
 			}
-			// Savepoint choreography with an aborted inner statement: the
-			// outer transaction must stay usable (ROLLBACK TO recovery).
 			spErr := tx.Tx(ctx, func(sp *rio.Tx) error {
-				_, err := rio.Exec(ctx, sp, "INSERT INTO rio_pg_native_probe_users (email, age, created_at, updated_at) VALUES ('sp@x', 1, now(), now())")
+				_, err := rio.Exec(
+					ctx,
+					sp,
+					"INSERT INTO rio_pg_native_probe_users "+
+						"(email, age, created_at, updated_at) "+
+						"VALUES ('sp@x', 1, now(), now())",
+				)
 				if err == nil {
 					t.Error("duplicate insert inside the savepoint must fail")
 				}
@@ -322,7 +469,6 @@ func TestNativeIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("outer Tx: %v", err)
 		}
-		// The savepoint's write must have been rolled back, the outer commit kept.
 		leaked, err := rio.From[nativeProbeUser]().Where("email = ?", "leak@x").Exists(ctx, db)
 		if err != nil {
 			t.Fatalf("Exists: %v", err)

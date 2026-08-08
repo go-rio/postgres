@@ -1,13 +1,5 @@
-// Package postgres connects github.com/go-rio/rio to PostgreSQL through the
-// pgx driver — via its database/sql adapter (Open, OpenPool) or fully
-// natively (OpenNative, the fastest read path; see the README's tier table).
-//
-// The package is deliberately thin: it constructs a *rio.DB with the built-in
-// rio.Postgres dialect, installs a precise error translator that maps
-// *pgconn.PgError values onto rio's sentinel errors, keeps the connection
-// settings honest about standard_conforming_strings, and adapts pgx to rio's
-// native-channel SPI. All SQL grammar lives in the rio core; this module
-// never shapes a query.
+// Package postgres connects rio to PostgreSQL through pgx's database/sql
+// adapter or rio's native execution path.
 package postgres
 
 import (
@@ -22,32 +14,13 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 )
 
-// Open opens a PostgreSQL database via pgx's database/sql adapter and wraps
-// it in a *rio.DB. The DSN is handed to pgx untouched, so both URL form
-// (postgres://user:pass@host:5432/app) and keyword/value form
-// (host=... user=... dbname=...) work, along with every pgx runtime
-// parameter — except one.
+// Open validates a pgx DSN and returns a rio DB using pgx's database/sql
+// adapter. It does not connect; use db.Unwrap().PingContext to verify
+// connectivity and db.Unwrap() to configure the pool.
 //
-// rio rewrites ? placeholders by lexing the SQL with
-// standard_conforming_strings on, the server default since PostgreSQL 9.1:
-// a backslash inside a '...' literal is an ordinary character. A session
-// running with the setting off lexes those literals differently — backslash
-// escapes again — so the server could disagree with rio about which ? are
-// placeholders. Open therefore rejects a configuration that turns the
-// setting off, whether spelled as a runtime parameter
-// (standard_conforming_strings=off) or inside the options startup parameter
-// (options=-c standard_conforming_strings=off — including one pgx inherits
-// from the PGOPTIONS environment variable). An explicit on passes through,
-// and when the setting is never mentioned nothing is injected: Open never
-// connects, so it cannot see the server's value. If your server turns the
-// setting off globally, turn it back on for rio's connections in the DSN —
-// the README shows a paste-ready example.
-//
-// Open validates the DSN eagerly — pgx's database/sql adapter would
-// otherwise surface a malformed DSN on the first query — but it does not
-// connect; ping the underlying pool (db.Unwrap().PingContext) to verify
-// connectivity. Pool tuning also happens on the *sql.DB returned by Unwrap —
-// rio never replaces or configures the connection pool.
+// Open rejects standard_conforming_strings=off, including settings supplied
+// through PGOPTIONS, because rio's placeholder lexer assumes the PostgreSQL
+// default. URL and keyword/value DSNs are both accepted.
 func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -63,18 +36,9 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	return New(db, opts...), nil
 }
 
-// New wraps an existing *sql.DB in a *rio.DB with the Postgres dialect and
-// this package's error translator. Use it when you bring your own pool: a
-// *sql.DB you tuned yourself, or one derived from a pgxpool.Pool via
-// stdlib.OpenDBFromPool.
-//
-// New performs no connection hygiene — the pool is the caller's; make sure
-// its sessions run with standard_conforming_strings on (the server default
-// since PostgreSQL 9.1), or rio's placeholder rewriting can disagree with
-// the server's lexing (see Open).
-//
-// Options are applied after the translator, so rio.WithErrorTranslator in
-// opts replaces this package's translation if you need to.
+// New wraps an existing *sql.DB with the Postgres dialect and error
+// translator. The caller must ensure standard_conforming_strings is on.
+// Options are applied last, so a supplied translator replaces the default.
 func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	merged := make([]rio.Option, 0, len(opts)+1)
 	merged = append(merged, rio.WithErrorTranslator(translate))
@@ -82,22 +46,21 @@ func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	return rio.New(db, rio.Postgres, merged...)
 }
 
-// errNonConformingStrings is the shared refusal for a configuration that
-// turns standard_conforming_strings off, worded once for every constructor
-// that can see the settings (Open and OpenPool).
 func errNonConformingStrings(op, bad string) error {
-	return fmt.Errorf("postgres: %s: the connection settings turn standard_conforming_strings off (%s), but rio rewrites ? placeholders assuming it is on — the server default since PostgreSQL 9.1, under which backslash is an ordinary character inside '...' literals — so the server would lex string literals differently from rio and the two could disagree on the placeholder count; remove the setting or set it to on", op, bad)
+	return fmt.Errorf(
+		"postgres: %s: the connection settings turn standard_conforming_strings off (%s), "+
+			"but rio rewrites ? placeholders assuming it is on — the server default since PostgreSQL 9.1, "+
+			"under which backslash is an ordinary character inside '...' literals — "+
+			"so the server would lex string literals differently from rio and "+
+			"the two could disagree on the placeholder count; remove the setting or set it to on",
+		op,
+		bad,
+	)
 }
 
-// nonConformingStringsSetting returns a description of the connection
-// setting that turns standard_conforming_strings off, or "" when the
-// parameters leave it alone (or explicitly on). It checks the two routes a
-// pgx config can carry the setting: the runtime parameter itself — URL query
-// and keyword/value DSNs both land here — and -c/--name flags inside the
-// options startup parameter, which pgx also fills from the PGOPTIONS
-// environment variable. Values are judged the way the server's parse_bool
-// judges them; a value that spells neither true nor false is left for the
-// server to refuse, loudly, at connect time.
+// nonConformingStringsSetting finds a false standard_conforming_strings
+// runtime parameter or startup option. Invalid boolean values are left for
+// PostgreSQL to reject.
 func nonConformingStringsSetting(params map[string]string) string {
 	for key, val := range params {
 		switch {
@@ -135,9 +98,8 @@ func nonConformingStringsSetting(params map[string]string) string {
 	return ""
 }
 
-// splitServerOptions splits an options startup parameter into arguments the
-// way the server's pg_split_opts does: on whitespace, with a backslash
-// escaping the byte after it (that is how a value keeps a literal space).
+// splitServerOptions follows PostgreSQL's whitespace and backslash rules for
+// startup options.
 func splitServerOptions(s string) []string {
 	var args []string
 	var cur strings.Builder
@@ -165,11 +127,7 @@ func splitServerOptions(s string) []string {
 	return args
 }
 
-// pgFalse reports whether v spells boolean false the way the server's
-// parse_bool does: a case-insensitive unique prefix of "false", "no" or
-// "off", or the digit "0". A lone "o" is ambiguous between on and off, so
-// parse_bool rejects it — and this function returns false for it, like for
-// every value that is not a valid false spelling.
+// pgFalse accepts PostgreSQL's unambiguous false spellings and prefixes.
 func pgFalse(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))
 	switch {
@@ -183,17 +141,13 @@ func pgFalse(v string) bool {
 	return false
 }
 
-// PostgreSQL error codes translated by this package. Class 23 is "Integrity
-// Constraint Violation" in the SQLSTATE standard.
+// PostgreSQL integrity-constraint SQLSTATE codes translated by this package.
 const (
 	codeUniqueViolation     = "23505"
 	codeForeignKeyViolation = "23503"
 )
 
-// translate maps a pgx error to the matching rio sentinel, or returns nil
-// when the error is not one this package recognizes. rio keeps the original
-// error in the chain, so errors.As still reaches the *pgconn.PgError with
-// the constraint name, table, and detail intact.
+// translate maps recognized pgx errors to rio sentinels.
 func translate(err error) error {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {

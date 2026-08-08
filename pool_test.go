@@ -11,10 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// --- Unit tests (no server) --------------------------------------------------
-
-// lazyPool builds a pool against an address nothing listens on — pgxpool
-// never connects eagerly, so construction always succeeds.
+// lazyPool creates a pool without establishing a connection.
 func lazyPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool, err := pgxpool.New(context.Background(), "postgres://user:pass@localhost:1/nowhere?sslmode=disable")
@@ -35,8 +32,6 @@ func TestOpenPoolInvalidDSN(t *testing.T) {
 }
 
 func TestOpenPoolRejectsNonConformingStrings(t *testing.T) {
-	// The full spelling matrix is nonConformingStringsSetting's own suite;
-	// here each route into the shared guard is proven once for OpenPool.
 	tests := []struct {
 		name string
 		dsn  string
@@ -76,8 +71,6 @@ func TestOpenPoolRejectsNonConformingStringsFromPGOPTIONS(t *testing.T) {
 }
 
 func TestOpenPoolDoesNotConnect(t *testing.T) {
-	// Like Open, OpenPool only validates: nothing listens on this address and
-	// construction must still succeed (pgxpool connects lazily).
 	db, err := OpenPool(context.Background(), "postgres://user:pass@localhost:1/nowhere?sslmode=disable")
 	if err != nil {
 		t.Fatalf("OpenPool: %v", err)
@@ -123,28 +116,21 @@ func TestNewFromPoolNilPanics(t *testing.T) {
 }
 
 func TestCloseClosesPool(t *testing.T) {
-	// The takeover contract without a server: after db.Close() the pool
-	// rejects acquisition with pgxpool's closed-pool error rather than a
-	// connection failure.
 	pool := lazyPool(t)
 	db := NewFromPool(pool)
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// pgxpool surfaces puddle's "closed pool" error; the sentinel is not
-	// re-exported, so the message is the stable signal.
+	// pgxpool does not export the underlying closed-pool sentinel.
 	err := pool.Ping(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "closed pool") {
 		t.Fatalf("after db.Close() the pool should be closed, Ping = %v", err)
 	}
-	// The documented reverse order stays safe: another close is a no-op.
 	pool.Close()
 	if err := db.Close(); err != nil {
 		t.Errorf("repeated Close: %v", err)
 	}
 }
-
-// --- Integration tests (real PostgreSQL, gated by RIO_POSTGRES_DSN) ----------
 
 func TestPoolIntegration(t *testing.T) {
 	dsn := os.Getenv("RIO_POSTGRES_DSN")
@@ -183,8 +169,6 @@ func TestPoolIntegration(t *testing.T) {
 	})
 
 	t.Run("TranslatorInstalled", func(t *testing.T) {
-		// Force a unique violation through the pool-backed handle: the
-		// module's translator must map it exactly as with Open.
 		for _, stmt := range []string{
 			"DROP TABLE IF EXISTS rio_pg_pool_users",
 			"CREATE TABLE rio_pg_pool_users (id bigint PRIMARY KEY)",
@@ -213,8 +197,6 @@ func TestPoolIntegration(t *testing.T) {
 	})
 
 	t.Run("PoolClosedFirstFailsLoudly", func(t *testing.T) {
-		// The documented reverse order: a pool closed out from under the view
-		// makes queries fail with the closed-pool error, never silently.
 		db2, err := OpenPool(ctx, dsn)
 		if err != nil {
 			t.Fatalf("OpenPool: %v", err)

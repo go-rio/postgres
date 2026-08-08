@@ -16,27 +16,38 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// --- Unit tests -------------------------------------------------------------
-
 func TestTranslate(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 		want error
 	}{
-		{"unique violation", &pgconn.PgError{Code: "23505"}, rio.ErrDuplicateKey},
-		{"foreign key violation", &pgconn.PgError{Code: "23503"}, rio.ErrForeignKeyViolated},
-		{"wrapped unique violation", fmt.Errorf("insert users: %w", &pgconn.PgError{Code: "23505"}), rio.ErrDuplicateKey},
-		{"deeply wrapped fk violation", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", &pgconn.PgError{Code: "23503"})), rio.ErrForeignKeyViolated},
-		{"unrelated pg error", &pgconn.PgError{Code: "42P01"}, nil},
-		{"not null violation is not ours", &pgconn.PgError{Code: "23502"}, nil},
-		{"non-pg error", errors.New("connection refused"), nil},
-		{"nil error", nil, nil},
+		{name: "unique violation", err: &pgconn.PgError{Code: "23505"}, want: rio.ErrDuplicateKey},
+		{
+			name: "foreign key violation",
+			err:  &pgconn.PgError{Code: "23503"},
+			want: rio.ErrForeignKeyViolated,
+		},
+		{
+			name: "wrapped unique violation",
+			err:  fmt.Errorf("insert users: %w", &pgconn.PgError{Code: "23505"}),
+			want: rio.ErrDuplicateKey,
+		},
+		{
+			name: "deeply wrapped fk violation",
+			err: fmt.Errorf(
+				"outer: %w",
+				fmt.Errorf("inner: %w", &pgconn.PgError{Code: "23503"}),
+			),
+			want: rio.ErrForeignKeyViolated,
+		},
+		{name: "unrelated pg error", err: &pgconn.PgError{Code: "42P01"}},
+		{name: "not null violation is not ours", err: &pgconn.PgError{Code: "23502"}},
+		{name: "non-pg error", err: errors.New("connection refused")},
+		{name: "nil error"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// translate returns the sentinel itself, so identity comparison
-			// is exact.
 			if got := translate(tt.err); got != tt.want {
 				t.Errorf("translate(%v) = %v, want %v", tt.err, got, tt.want)
 			}
@@ -67,8 +78,6 @@ func TestOpenRejectsNonConformingStrings(t *testing.T) {
 			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=false"},
 		{"spelled 0",
 			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=0"},
-		// The server's parse_bool accepts any unique prefix of its
-		// spellings; "f" is false.
 		{"parse_bool prefix",
 			"postgres://user:pass@localhost:5432/app?standard_conforming_strings=f"},
 		{"upper-case value",
@@ -99,8 +108,6 @@ func TestOpenRejectsNonConformingStrings(t *testing.T) {
 }
 
 func TestOpenRejectsNonConformingStringsFromPGOPTIONS(t *testing.T) {
-	// pgx reads the PGOPTIONS environment variable into the options startup
-	// parameter, so the check must catch that route too.
 	t.Setenv("PGOPTIONS", "-c standard_conforming_strings=off")
 	db, err := Open("postgres://user:pass@localhost:5432/app")
 	if err == nil {
@@ -129,9 +136,7 @@ func TestOpenAllowsConformingStrings(t *testing.T) {
 			"host=localhost dbname=app options='-c search_path=public'"},
 		{"options turning it on",
 			"host=localhost dbname=app options='-c standard_conforming_strings=on'"},
-		// parse_bool treats a lone "o" as ambiguous and anything unknown as
-		// invalid; the server refuses such a startup value itself, loudly —
-		// not ours to second-guess.
+		// PostgreSQL rejects ambiguous and invalid values at connection time.
 		{"ambiguous o passes through",
 			"postgres://user:pass@localhost/app?standard_conforming_strings=o"},
 		{"invalid value passes through",
@@ -172,8 +177,6 @@ func TestSplitServerOptions(t *testing.T) {
 	}{
 		{"-c a=1 -c b=2", []string{"-c", "a=1", "-c", "b=2"}},
 		{"  -c  a=1\t--b=2 ", []string{"-c", "a=1", "--b=2"}},
-		// A backslash escapes the next byte, the server's pg_split_opts rule
-		// that keeps escaped spaces inside a single argument.
 		{`-c search_path=a\ b`, []string{"-c", "search_path=a b"}},
 		{`a\\b`, []string{`a\b`}},
 		{"", nil},
@@ -186,8 +189,6 @@ func TestSplitServerOptions(t *testing.T) {
 }
 
 func TestOpenDoesNotConnect(t *testing.T) {
-	// Like sql.Open, Open only validates the DSN; nothing listens on this
-	// address and Open must still succeed.
 	db, err := Open("postgres://user:pass@localhost:1/nowhere?sslmode=disable")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -197,9 +198,7 @@ func TestOpenDoesNotConnect(t *testing.T) {
 	}
 }
 
-// stubDriver is a database/sql driver whose every ExecContext fails with a
-// *pgconn.PgError carrying the SQLSTATE given as the DSN. It lets the unit
-// suite prove that New wires the translator into rio without a server.
+// stubDriver returns a PgError whose SQLSTATE is supplied as the DSN.
 type stubDriver struct{}
 
 func (stubDriver) Open(code string) (driver.Conn, error) { return stubConn{code: code}, nil }
@@ -242,7 +241,6 @@ func TestNewInstallsTranslator(t *testing.T) {
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("err = %v, want errors.Is(err, %v)", err, tt.want)
 			}
-			// The driver error must stay in the chain for errors.As.
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || pgErr.Code != tt.code {
 				t.Fatalf("errors.As should reach the *pgconn.PgError with code %s, got %v", tt.code, err)
@@ -265,8 +263,6 @@ func TestNewUserTranslatorWins(t *testing.T) {
 		t.Fatalf("a user-supplied translator should replace the package one; err = %v", err)
 	}
 }
-
-// --- Integration tests (real PostgreSQL, gated by RIO_POSTGRES_DSN) ---------
 
 type pgUser struct {
 	ID        int64
@@ -302,7 +298,6 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("ping %s: %v", dsn, err)
 	}
 
-	// A fresh schema per run; drop first so a failed run stays inspectable.
 	for _, stmt := range []string{
 		"DROP TABLE IF EXISTS rio_pg_posts",
 		"DROP TABLE IF EXISTS rio_pg_users",
@@ -387,9 +382,6 @@ func TestIntegration(t *testing.T) {
 				return err
 			}
 
-			// The inner transaction is a savepoint. Its failed statement
-			// aborts only the savepoint; ROLLBACK TO must leave the outer
-			// transaction alive.
 			inner := tx.Tx(ctx, func(tx2 *rio.Tx) error {
 				dup := pgUser{Email: "ada@example.com"}
 				return rio.Insert(ctx, tx2, &dup)
@@ -398,8 +390,6 @@ func TestIntegration(t *testing.T) {
 				t.Errorf("inner err = %v, want rio.ErrDuplicateKey", inner)
 			}
 
-			// PostgreSQL aborts the whole transaction on error unless the
-			// savepoint machinery worked; this insert proves it did.
 			linus := pgUser{Email: "linus@example.com"}
 			return rio.Insert(ctx, tx, &linus)
 		})

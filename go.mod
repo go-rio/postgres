@@ -1,9 +1,9 @@
 module github.com/go-rio/postgres
 
-go 1.25.0
+go 1.27rc2
 
 require (
-	github.com/go-rio/rio v0.9.0
+	github.com/go-rio/rio v0.10.0
 	github.com/jackc/pgx/v5 v5.10.0
 )
 
