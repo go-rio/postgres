@@ -5,9 +5,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-	"runtime"
-	"sync"
-	"weak"
 
 	"github.com/go-rio/rio"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,9 +43,9 @@ func NewFromPool(pool *pgxpool.Pool, opts ...rio.Option) *rio.DB {
 	view := sql.OpenDB(poolConnector{Connector: stdlib.GetPoolConnector(pool), pool: pool})
 	// An idle database/sql connection would pin a pool connection.
 	view.SetMaxIdleConns(0)
-	db := New(view, opts...)
-	registerPool(db, pool)
-	return db
+	// The handle rides on the DB itself (rio.WithDriverHandle), so PoolOf is
+	// a plain assertion and the pool's lifecycle needs no side registry.
+	return New(view, append([]rio.Option{rio.WithDriverHandle(pool)}, opts...)...)
 }
 
 // PoolOf returns the pool managed by a pool-backed or native rio DB. It
@@ -57,13 +54,8 @@ func PoolOf(db *rio.DB) *pgxpool.Pool {
 	if db == nil {
 		return nil
 	}
-	// Native DBs expose the pool directly; adapter DBs use the registry below.
-	if pool, ok := db.Native().(*pgxpool.Pool); ok {
-		return pool
-	}
-	pools.RLock()
-	defer pools.RUnlock()
-	return pools.m[weak.Make(db)]
+	pool, _ := db.DriverHandle().(*pgxpool.Pool)
+	return pool
 }
 
 // poolConnector makes the database/sql view own the underlying pool.
@@ -75,25 +67,4 @@ type poolConnector struct {
 func (c poolConnector) Close() error {
 	c.pool.Close()
 	return nil
-}
-
-// Weak keys keep abandoned rio DBs from pinning registry entries.
-var pools struct {
-	sync.RWMutex
-	m map[weak.Pointer[rio.DB]]*pgxpool.Pool
-}
-
-func registerPool(db *rio.DB, pool *pgxpool.Pool) {
-	key := weak.Make(db)
-	pools.Lock()
-	if pools.m == nil {
-		pools.m = make(map[weak.Pointer[rio.DB]]*pgxpool.Pool)
-	}
-	pools.m[key] = pool
-	pools.Unlock()
-	runtime.AddCleanup(db, func(k weak.Pointer[rio.DB]) {
-		pools.Lock()
-		delete(pools.m, k)
-		pools.Unlock()
-	}, key)
 }
