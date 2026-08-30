@@ -34,6 +34,14 @@ func OpenNative(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, e
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open native: %w", err)
 	}
+	// rio.NewNative panics on construction misuse (rio.WithStmtCache); the
+	// caller never saw the pool, so a recovered panic must not leak it.
+	defer func() {
+		if p := recover(); p != nil {
+			pool.Close()
+			panic(p)
+		}
+	}()
 	return NewNativeFromPool(pool, opts...), nil
 }
 
@@ -104,6 +112,12 @@ func (d *nativeDB) Close() error {
 
 type nativeTx struct {
 	tx pgx.Tx
+	// done latches after Commit or Rollback ran: pgxpool's Tx releases its
+	// connection either way, so a later Conn().IsClosed() would read a
+	// connection another goroutine may already be using (rio's panic-cleanup
+	// rollback after a successful commit takes exactly this path). rio never
+	// uses a Tx concurrently, so a plain bool suffices.
+	done bool
 }
 
 func (t *nativeTx) Query(ctx context.Context, sqlText string, args []any) (rio.NativeRows, error) {
@@ -119,14 +133,20 @@ func (t *nativeTx) Exec(ctx context.Context, sqlText string, args []any) (int64,
 	return tag.RowsAffected(), nil
 }
 
-func (t *nativeTx) Commit(ctx context.Context) error {
-	wasClosed := t.tx.Conn().IsClosed()
-	return doneAsTxDone(t.tx.Commit(ctx), wasClosed)
-}
+func (t *nativeTx) Commit(ctx context.Context) error   { return t.finish(ctx, t.tx.Commit) }
+func (t *nativeTx) Rollback(ctx context.Context) error { return t.finish(ctx, t.tx.Rollback) }
 
-func (t *nativeTx) Rollback(ctx context.Context) error {
+// finish runs the transaction's terminal operation exactly once: the done
+// latch answers later calls without touching the released connection, and
+// the pre-read IsClosed feeds doneAsTxDone's ErrTxDone mapping.
+func (t *nativeTx) finish(ctx context.Context, op func(context.Context) error) error {
+	if t.done {
+		return fmt.Errorf("%w (%w)", sql.ErrTxDone, pgx.ErrTxClosed)
+	}
 	wasClosed := t.tx.Conn().IsClosed()
-	return doneAsTxDone(t.tx.Rollback(ctx), wasClosed)
+	err := op(ctx)
+	t.done = true
+	return doneAsTxDone(err, wasClosed)
 }
 
 // nativeRows assigns one pgtype scanner interface per rio cell so pgx cannot
