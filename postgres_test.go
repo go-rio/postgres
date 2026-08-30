@@ -267,7 +267,7 @@ func TestNewUserTranslatorWins(t *testing.T) {
 type pgUser struct {
 	ID        int64
 	Email     string
-	Nickname  string `rio:",omitzero"` // omitted when zero so the DB default applies
+	Nickname  string `rio:",omitzero"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -401,7 +401,7 @@ func TestIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Count: %v", err)
 		}
-		if n != 3 { // ada, grace, linus — and no duplicate ada
+		if n != 3 { // ada, grace, linus
 			t.Errorf("user count = %d, want 3", n)
 		}
 		for _, email := range []string{"grace@example.com", "linus@example.com"} {

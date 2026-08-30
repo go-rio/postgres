@@ -15,12 +15,9 @@ import (
 )
 
 // Open validates a pgx DSN and returns a rio DB using pgx's database/sql
-// adapter. It does not connect; use db.Unwrap().PingContext to verify
-// connectivity and db.Unwrap() to configure the pool.
-//
-// Open rejects standard_conforming_strings=off, including settings supplied
-// through PGOPTIONS, because rio's placeholder lexer assumes the PostgreSQL
-// default. URL and keyword/value DSNs are both accepted.
+// adapter. It does not connect; ping and configure the pool via db.Unwrap().
+// URL and keyword/value DSNs are accepted; standard_conforming_strings=off
+// is rejected, including via PGOPTIONS.
 func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -38,7 +35,7 @@ func Open(dsn string, opts ...rio.Option) (*rio.DB, error) {
 
 // New wraps an existing *sql.DB with the Postgres dialect and error
 // translator. The caller must ensure standard_conforming_strings is on.
-// Options are applied last, so a supplied translator replaces the default.
+// Options apply last; a supplied translator replaces the default.
 func New(db *sql.DB, opts ...rio.Option) *rio.DB {
 	merged := make([]rio.Option, 0, len(opts)+1)
 	merged = append(merged, rio.WithErrorTranslator(translate))
@@ -58,9 +55,8 @@ func errNonConformingStrings(op, bad string) error {
 	)
 }
 
-// nonConformingStringsSetting finds a false standard_conforming_strings
-// runtime parameter or startup option. Invalid boolean values are left for
-// PostgreSQL to reject.
+// nonConformingStringsSetting finds a false standard_conforming_strings in
+// runtime params or startup options; invalid booleans are left to PostgreSQL.
 func nonConformingStringsSetting(params map[string]string) string {
 	for key, val := range params {
 		switch {
@@ -86,8 +82,7 @@ func nonConformingStringsSetting(params map[string]string) string {
 				if !ok {
 					continue
 				}
-				// The server's ParseLongOption reads dashes in a GUC name
-				// as underscores; GUC lookup ignores case.
+				// Server GUC parsing maps dashes to underscores, ignoring case.
 				name = strings.ReplaceAll(name, "-", "_")
 				if strings.EqualFold(name, "standard_conforming_strings") && pgFalse(value) {
 					return "options: -c standard_conforming_strings=" + value
@@ -98,8 +93,7 @@ func nonConformingStringsSetting(params map[string]string) string {
 	return ""
 }
 
-// splitServerOptions follows PostgreSQL's whitespace and backslash rules for
-// startup options.
+// splitServerOptions follows PostgreSQL's whitespace and backslash rules.
 func splitServerOptions(s string) []string {
 	var args []string
 	var cur strings.Builder
@@ -141,7 +135,6 @@ func pgFalse(v string) bool {
 	return false
 }
 
-// PostgreSQL integrity-constraint SQLSTATE codes translated by this package.
 const (
 	codeUniqueViolation     = "23505"
 	codeForeignKeyViolation = "23503"

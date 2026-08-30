@@ -14,14 +14,12 @@ import (
 )
 
 // OpenNative validates a pgxpool DSN and returns a rio DB that executes
-// queries directly through pgx. It connects lazily; use PoolOf(db).Ping(ctx)
-// to verify connectivity. Like Open, it rejects
-// standard_conforming_strings=off.
+// queries directly through pgx. It connects lazily (ping via PoolOf) and,
+// like Open, rejects standard_conforming_strings=off.
 //
-// Statement caching is controlled by pgx's default_query_exec_mode;
-// rio.WithStmtCache is unsupported. Tx.Unwrap returns nil, so use TxOf for
-// the pgx transaction. db.Unwrap returns a database/sql view for compatible
-// helpers, but pooling must be configured through pgxpool.
+// rio.WithStmtCache is unsupported; use pgx's default_query_exec_mode.
+// Tx.Unwrap returns nil — use TxOf. db.Unwrap returns a database/sql view;
+// configure pooling through pgxpool, never the view.
 func OpenNative(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -34,8 +32,7 @@ func OpenNative(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, e
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open native: %w", err)
 	}
-	// rio.NewNative panics on construction misuse (rio.WithStmtCache); the
-	// caller never saw the pool, so a recovered panic must not leak it.
+	// A construction panic (e.g. rio.WithStmtCache) must not leak the pool.
 	defer func() {
 		if p := recover(); p != nil {
 			pool.Close()
@@ -46,8 +43,8 @@ func OpenNative(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, e
 }
 
 // NewNativeFromPool wraps a caller-built pgxpool.Pool for native execution
-// and takes ownership of it. The caller must ensure
-// standard_conforming_strings is on. Closing the rio DB closes the pool.
+// and takes ownership: closing the rio DB closes the pool. The caller must
+// ensure standard_conforming_strings is on.
 func NewNativeFromPool(pool *pgxpool.Pool, opts ...rio.Option) *rio.DB {
 	if pool == nil {
 		panic("postgres: NewNativeFromPool: pool must not be nil")
@@ -58,7 +55,7 @@ func NewNativeFromPool(pool *pgxpool.Pool, opts ...rio.Option) *rio.DB {
 	return rio.NewNative(rio.NativeConfig{
 		DB:     &nativeDB{pool: pool},
 		Handle: pool,
-		// This non-owning view keeps Unwrap available to database/sql helpers.
+		// Non-owning view backing db.Unwrap.
 		SQLView: stdlib.OpenDBFromPool(pool),
 	}, rio.Postgres, merged...)
 }
@@ -112,11 +109,8 @@ func (d *nativeDB) Close() error {
 
 type nativeTx struct {
 	tx pgx.Tx
-	// done latches after Commit or Rollback ran: pgxpool's Tx releases its
-	// connection either way, so a later Conn().IsClosed() would read a
-	// connection another goroutine may already be using (rio's panic-cleanup
-	// rollback after a successful commit takes exactly this path). rio never
-	// uses a Tx concurrently, so a plain bool suffices.
+	// done latches after Commit/Rollback: the connection is released either
+	// way and must not be touched again. rio never uses a Tx concurrently.
 	done bool
 }
 
@@ -136,9 +130,8 @@ func (t *nativeTx) Exec(ctx context.Context, sqlText string, args []any) (int64,
 func (t *nativeTx) Commit(ctx context.Context) error   { return t.finish(ctx, t.tx.Commit) }
 func (t *nativeTx) Rollback(ctx context.Context) error { return t.finish(ctx, t.tx.Rollback) }
 
-// finish runs the transaction's terminal operation exactly once: the done
-// latch answers later calls without touching the released connection, and
-// the pre-read IsClosed feeds doneAsTxDone's ErrTxDone mapping.
+// finish runs the terminal operation once; IsClosed is read before op so
+// doneAsTxDone can map an already-dead connection.
 func (t *nativeTx) finish(ctx context.Context, op func(context.Context) error) error {
 	if t.done {
 		return fmt.Errorf("%w (%w)", sql.ErrTxDone, pgx.ErrTxClosed)
@@ -150,8 +143,7 @@ func (t *nativeTx) finish(ctx context.Context, op func(context.Context) error) e
 }
 
 // nativeRows assigns one pgtype scanner interface per rio cell so pgx cannot
-// select an incompatible codec. Unsupported kinds fall back to sql.Scanner.
-// The translated destinations are reused for every row.
+// select an incompatible codec; unsupported kinds fall back to sql.Scanner.
 type nativeRows struct {
 	rows            pgx.Rows
 	cols            []string
@@ -190,8 +182,8 @@ func (r *nativeRows) Scan(dest ...any) error {
 	return r.rows.Scan(r.dests...)
 }
 
-// pgCell is the shared backing layout for the per-kind adapters. Converting a
-// slot pointer to a named view preserves each view's narrow pgx method set.
+// pgCell backs the per-kind adapter views; each named view keeps its narrow
+// pgx method set.
 type pgCell struct{ c rio.NativeCell }
 
 type intCell pgCell
@@ -299,7 +291,7 @@ func (r *nativeRows) translate(dest []any) {
 			continue
 		}
 		kind := cell.ScanKind()
-		// Numeric uses its decimal-string fallback to preserve full uint64 range.
+		// Numeric falls back to decimal strings to keep the full uint64 range.
 		if kind == rio.NativeKindUint && int(fds[i].DataTypeOID) == pgtype.NumericOID {
 			kind = rio.NativeKindScanner
 		}
@@ -323,7 +315,6 @@ func (r *nativeRows) translate(dest []any) {
 			r.cells[i].c = cell
 			out[i] = (*timeCell)(&r.cells[i])
 		default:
-			// New kinds retain the driver-canonical sql.Scanner fallback.
 			out[i] = cell
 		}
 	}
@@ -355,8 +346,8 @@ func mapTxOptions(opts *sql.TxOptions) (pgx.TxOptions, error) {
 	return pgxOpts, nil
 }
 
-// doneAsTxDone exposes a pgx-closed transaction or connection as sql.ErrTxDone
-// while preserving the original error in the chain.
+// doneAsTxDone exposes a pgx-closed transaction or connection as sql.ErrTxDone,
+// keeping the original error in the chain.
 func doneAsTxDone(err error, wasClosed bool) error {
 	if err != nil && (wasClosed || errors.Is(err, pgx.ErrTxClosed)) {
 		return fmt.Errorf("%w (%w)", sql.ErrTxDone, err)
@@ -364,8 +355,7 @@ func doneAsTxDone(err error, wasClosed bool) error {
 	return err
 }
 
-// wrapRows preloads the first row so errors deferred by pgx statement caching
-// remain inside rio's query translation and hook boundary.
+// wrapRows prefetches the first row so pgx-deferred errors surface at the query.
 func wrapRows(rows pgx.Rows, err error) (rio.NativeRows, error) {
 	if err != nil {
 		if rows != nil {
@@ -381,4 +371,55 @@ func wrapRows(rows pgx.Rows, err error) (rio.NativeRows, error) {
 		return nil, err
 	}
 	return &nativeRows{rows: rows}, nil
+}
+
+// --- batching ---
+
+// QueryBatch runs all statements in one round trip; results are ordered, each via wrapRows.
+func (d *nativeDB) QueryBatch(ctx context.Context, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
+	return sendBatch(ctx, d.pool, stmts)
+}
+
+func (t *nativeTx) QueryBatch(ctx context.Context, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
+	return sendBatch(ctx, t.tx, stmts)
+}
+
+type batchSender interface {
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
+}
+
+func sendBatch(ctx context.Context, s batchSender, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
+	b := &pgx.Batch{}
+	for _, st := range stmts {
+		b.Queue(st.SQL, st.Args...)
+	}
+	return &nativeBatchResults{res: s.SendBatch(ctx, b), remaining: len(stmts)}, nil
+}
+
+type nativeBatchResults struct {
+	res       pgx.BatchResults
+	remaining int
+}
+
+func (r *nativeBatchResults) Rows() (rio.NativeRows, bool, error) {
+	if r.remaining == 0 {
+		return nil, true, nil
+	}
+	r.remaining--
+	nr, err := wrapRows(r.res.Query())
+	if err != nil {
+		return nil, false, err
+	}
+	return nr, false, nil
+}
+
+func (r *nativeBatchResults) Close() error { return r.res.Close() }
+
+// CopyIn streams rows over COPY; the table's name segments map onto pgx.Identifier.
+func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
+	return d.pool.CopyFrom(ctx, pgx.Identifier(table), columns, pgx.CopyFromFunc(next))
+}
+
+func (t *nativeTx) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
+	return t.tx.CopyFrom(ctx, pgx.Identifier(table), columns, pgx.CopyFromFunc(next))
 }
