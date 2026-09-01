@@ -3,7 +3,7 @@ module github.com/go-rio/postgres
 go 1.27.0
 
 require (
-	github.com/go-rio/rio v0.13.0
+	github.com/go-rio/rio v0.16.0
 	github.com/jackc/pgx/v5 v5.10.0
 )
 
