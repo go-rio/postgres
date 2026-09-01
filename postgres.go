@@ -14,6 +14,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 )
 
+const (
+	codeUniqueViolation     = "23505"
+	codeForeignKeyViolation = "23503"
+)
+
 // Open validates a pgx DSN and returns a rio DB using pgx's database/sql
 // adapter. It does not connect; ping and configure the pool via db.Unwrap().
 // URL and keyword/value DSNs are accepted; standard_conforming_strings=off
@@ -98,7 +103,7 @@ func splitServerOptions(s string) []string {
 	var args []string
 	var cur strings.Builder
 	escaped := false
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch {
 		case escaped:
@@ -134,11 +139,6 @@ func pgFalse(v string) bool {
 	}
 	return false
 }
-
-const (
-	codeUniqueViolation     = "23505"
-	codeForeignKeyViolation = "23503"
-)
 
 // translate maps recognized pgx errors to rio sentinels.
 func translate(err error) error {

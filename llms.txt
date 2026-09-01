@@ -1,0 +1,108 @@
+# go-rio/postgres
+
+> PostgreSQL driver module for the rio ORM on pgx: database/sql, pgxpool, and native channels with batched preloads and COPY inserts.
+
+## Overview
+
+`github.com/go-rio/postgres` connects `github.com/go-rio/rio` to PostgreSQL through pgx. Three constructors give three execution paths with one rio API: `Open`/`New` (pgx's database/sql adapter), `OpenPool`/`NewFromPool` (database/sql over a pgxpool), and `OpenNative`/`NewNativeFromPool` (queries executed directly by pgx: fewer scan allocations, one round trip per preload layer, `COPY` for explicit-key `InsertAll`). The module validates `standard_conforming_strings`, translates SQLSTATE 23505 and 23503 to rio sentinels, and exposes the pool (`PoolOf`) and the pgx transaction (`TxOf`). rio itself renders the SQL.
+
+## Quick Start
+
+```bash
+go get github.com/go-rio/postgres
+```
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/go-rio/postgres"
+    "github.com/go-rio/rio"
+)
+
+type User struct {
+    ID    int64
+    Email string
+    Age   int
+}
+
+func main() {
+    ctx := context.Background()
+    db, err := postgres.OpenNative(ctx, "postgres://user:pass@localhost:5432/app")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+    users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Println(len(users))
+}
+```
+
+## Key Concepts
+
+- **Three channels, one API**: pick database/sql for instrumentation and sqlmock, pgxpool for pool control, native for throughput.
+- **Pool ownership**: `OpenPool`, `NewFromPool`, `OpenNative`, and `NewNativeFromPool` own the pool; closing the rio DB closes it. Configure connections on pgxpool, never on `db.Unwrap()`.
+- **standard_conforming_strings must be on**: rio's placeholder lexer assumes it; `Open*` reject an explicit off and cannot inspect a caller-built pool.
+- **Native transactions**: `tx.Unwrap()` is nil; `postgres.TxOf(tx)` returns the `pgx.Tx`. `rio.WithStmtCache` panics on the native path; use pgx's `default_query_exec_mode`.
+- **Typed key arrays**: preload and count key sets bind as one array parameter (`= ANY($1)`), so their statement text is stable.
+
+## API Reference
+
+### Core Functions
+
+- `Open(dsn string, opts ...rio.Option) (*rio.DB, error)` - validate the DSN and open lazily through pgx's database/sql adapter.
+- `New(db *sql.DB, opts ...rio.Option) *rio.DB` - wrap an existing `*sql.DB` with the Postgres dialect and translator.
+- `OpenPool(ctx, dsn string, opts ...rio.Option) (*rio.DB, error)` - build a pgxpool from the DSN (`pool_*` parameters) and serve database/sql over it.
+- `NewFromPool(pool *pgxpool.Pool, opts ...rio.Option) *rio.DB` - database/sql over a caller-built pool; takes ownership.
+- `OpenNative(ctx, dsn string, opts ...rio.Option) (*rio.DB, error)` - native pgx execution over a new pool.
+- `NewNativeFromPool(pool *pgxpool.Pool, opts ...rio.Option) *rio.DB` - native pgx execution over a caller-built pool; takes ownership.
+- `PoolOf(db *rio.DB) *pgxpool.Pool` - the pool behind a pool-backed or native DB, nil otherwise.
+- `TxOf(tx *rio.Tx) pgx.Tx` - the pgx transaction behind a native rio transaction, nil otherwise.
+
+## Common Patterns
+
+### SET LOCAL inside a native transaction
+
+```go
+err := db.Tx(ctx, func(tx *rio.Tx) error {
+    if _, err := postgres.TxOf(tx).Exec(ctx, "SET LOCAL statement_timeout = '5s'"); err != nil {
+        return err
+    }
+    _, err := rio.From[User]().Where("id = ?", 1).UpdateAll(ctx, tx, rio.Set{"age": 31})
+    return err
+})
+```
+
+### PgBouncer in transaction mode
+
+```text
+postgres://user:pass@pgbouncer:6432/app?default_query_exec_mode=exec
+```
+
+### Arrays through a Valuer/Scanner wrapper
+
+```go
+type Tags []string // Value() encodes pgtype.FlatArray[string]; Scan() decodes it
+```
+
+## Error Handling
+
+- `rio.ErrDuplicateKey` - SQLSTATE 23505; the `*pgconn.PgError` stays in the chain for `errors.As`.
+- `rio.ErrForeignKeyViolated` - SQLSTATE 23503.
+- `sql.ErrTxDone` - a native `Commit`/`Rollback` after completion or on a dead connection, with the pgx error in the chain.
+- `Open*` errors - a DSN pgx cannot parse, or one that turns `standard_conforming_strings` off.
+
+## References
+
+- Documentation: https://github.com/go-rio/postgres/blob/main/README.md
+- Changelog: https://github.com/go-rio/postgres/blob/main/CHANGELOG.md
+- Repository: https://github.com/go-rio/postgres
+- Go Reference: https://pkg.go.dev/github.com/go-rio/postgres
+- Core ORM: https://github.com/go-rio/rio
+- Issues: https://github.com/go-rio/postgres/issues

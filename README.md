@@ -7,8 +7,20 @@
 [![License](https://img.shields.io/github/license/go-rio/postgres)](https://opensource.org/license/MIT)
 
 PostgreSQL driver module for [rio](https://github.com/go-rio/rio), built on
-[pgx](https://github.com/jackc/pgx). Two channels: database/sql (plain or
-over pgxpool) and native pgx execution.
+[pgx](https://github.com/jackc/pgx): a database/sql channel (plain or over
+pgxpool) and a native pgx channel with batched preloads and `COPY` inserts.
+rio renders the SQL.
+
+```go
+db, err := postgres.OpenNative(ctx, "postgres://user:pass@localhost:5432/app")
+if err != nil {
+	return err
+}
+defer db.Close()
+
+users, err := rio.From[User]().Where("age > ?", 18).With("Posts").All(ctx, db)
+err = rio.InsertAll(ctx, db, rows) // explicit keys stream over COPY
+```
 
 ## Getting started
 
@@ -17,30 +29,44 @@ go get github.com/go-rio/postgres
 ```
 
 ```go
-db, err := postgres.Open("postgres://user:pass@localhost:5432/app")
-if err != nil {
-	log.Fatal(err)
-}
-defer db.Close()
+package main
 
-users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
+import (
+	"context"
+	"log"
+
+	"github.com/go-rio/postgres"
+	"github.com/go-rio/rio"
+)
+
+type User struct {
+	ID    int64
+	Email string
+	Age   int
+}
+
+func main() {
+	ctx := context.Background()
+	db, err := postgres.Open("postgres://user:pass@localhost:5432/app")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	users, err := rio.From[User]().Where("age > ?", 18).All(ctx, db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("%d adults", len(users))
+}
 ```
 
-`Open` validates the DSN — pgx URL or keyword/value form — but does not
-connect; ping with `db.Unwrap().PingContext(ctx)`. `New` wraps an existing
-`*sql.DB` and leaves session configuration to the caller.
+Requires Go 1.27 and PostgreSQL 9.1 or later (`standard_conforming_strings`
+on); the test suite runs against PostgreSQL 18.
 
-### Error translation
+## Features
 
-| SQLSTATE | rio sentinel |
-|---|---|
-| 23505 | `rio.ErrDuplicateKey` |
-| 23503 | `rio.ErrForeignKeyViolated` |
-
-The original `*pgconn.PgError` stays available through `errors.As`, including
-its constraint, table, and detail fields.
-
-## Execution paths
+### Execution paths
 
 rio queries use the same API on all three paths.
 
@@ -48,9 +74,13 @@ rio queries use the same API on all three paths.
 |---|---|---|
 | database/sql | `Open`, `New` | `*sql.DB` pooling, sqlmock, database/sql instrumentation. |
 | database/sql over pgxpool | `OpenPool`, `NewFromPool` | pgxpool configuration and `PoolOf` with the database/sql query path. |
-| native pgx | `OpenNative`, `NewNativeFromPool` | Lower scan allocations, pgx execution modes and transaction semantics. |
+| native pgx | `OpenNative`, `NewNativeFromPool` | Lower scan allocations, one round trip per preload layer, `COPY` inserts, pgx execution modes and transaction semantics. |
 
-## standard_conforming_strings
+`Open` validates the DSN — pgx URL or keyword/value form — but does not
+connect; ping with `db.Unwrap().PingContext(ctx)`. `New` wraps an existing
+`*sql.DB` and leaves session configuration to the caller.
+
+### standard_conforming_strings
 
 rio's placeholder lexer requires `standard_conforming_strings=on`, the
 PostgreSQL default since 9.1. `Open`, `OpenPool`, and `OpenNative` reject an
@@ -65,7 +95,7 @@ postgres://user:pass@localhost:5432/app?options=-c%20standard_conforming_strings
 `New`, `NewFromPool`, and `NewNativeFromPool` cannot inspect an existing
 pool; their callers must enforce this requirement.
 
-## pgxpool with database/sql
+### pgxpool with database/sql
 
 ```go
 db, err := postgres.OpenPool(ctx, "postgres://user:pass@localhost:5432/app?pool_max_conns=10")
@@ -83,7 +113,7 @@ defer db.Close()
 - Configure connection counts on pgxpool, not on `db.Unwrap()`; the
   database/sql view keeps no idle connections.
 
-## Native pgx execution
+### Native pgx execution
 
 `OpenNative` executes rio queries directly through pgx, preserving rio's SQL
 rendering, scanning rules, sentinel errors, hooks, and savepoint behavior.
@@ -107,7 +137,7 @@ migrations and pings, never for pool configuration.
 
 [rio's PostgreSQL benchmarks](https://github.com/go-rio/rio/blob/main/bench/bench_pg_test.go) compare both channels.
 
-## Query exec mode and PgBouncer
+### Query exec mode and PgBouncer
 
 The native path uses pgx's default `cache_statement` mode. Change it with the
 `default_query_exec_mode` DSN parameter or on a caller-built pool config.
@@ -122,7 +152,16 @@ On the database/sql paths, `rio.WithStmtCache` (off by default) adds DB- and
 transaction-local caches on top of pgx's per-connection cache. Do not use it
 behind transaction- or statement-mode poolers.
 
-## Arrays and JSONB
+### Key sets and row locks
+
+Preload and `WithCount` key sets bind as one typed array parameter
+(`"posts"."user_id" = ANY($1)`) on both channels, so the statement text does
+not vary with the number of parents and pgx's statement cache hits every
+time; user `IN (?)` slices still expand. `ForUpdate` and `ForShare` accept
+`rio.NoWait` and `rio.SkipLocked`, and `UpdateAllReturning` and
+`DeleteAllReturning` scan the affected rows back.
+
+### Arrays and JSONB
 
 Tag JSON fields with `rio:",json"` to store them as `jsonb` (for example
 `Prefs map[string]any` on an `Account` model, column `prefs`); a set-based
@@ -158,11 +197,26 @@ literal question mark as `??` (`?|` → `??|`, `?&` → `??&`):
 rio.From[Account]().Where("prefs ?? ?", "beta").All(ctx, db) // prefs ? $1
 ```
 
+### Error translation
+
+| SQLSTATE | rio sentinel |
+|---|---|
+| 23505 | `rio.ErrDuplicateKey` |
+| 23503 | `rio.ErrForeignKeyViolated` |
+
+The original `*pgconn.PgError` stays available through `errors.As`, including
+its constraint, table, and detail fields.
+
 ## Contributing
 
-Use Go 1.27 or newer, then run `go test ./...`, `go test -race ./...`, and
-`go vet ./...` before opening a pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md): a clone, `go test ./...`, and the
+one-line Docker command for the gated integration tests.
+
+## Contributors
+
+Thanks to everyone who has filed issues and opened pull requests on
+[go-rio/postgres](https://github.com/go-rio/postgres/graphs/contributors).
 
 ## License
 
-[MIT](LICENSE)
+The [MIT License](LICENSE). Copyright (c) 2026-now TreeNewBee.

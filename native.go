@@ -73,6 +73,8 @@ func TxOf(tx *rio.Tx) pgx.Tx {
 	return nil
 }
 
+// nativeDB is the pool-backed rio.NativeDB; it also batches preload layers
+// and streams InsertAll over COPY.
 type nativeDB struct {
 	pool *pgxpool.Pool
 }
@@ -107,6 +109,18 @@ func (d *nativeDB) Close() error {
 	return nil
 }
 
+// QueryBatch runs all statements in one round trip; results come back in
+// order, each through wrapRows.
+func (d *nativeDB) QueryBatch(ctx context.Context, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
+	return sendBatch(ctx, d.pool, stmts)
+}
+
+// CopyIn streams rows over COPY; the table's name segments map onto pgx.Identifier.
+func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
+	return d.pool.CopyFrom(ctx, pgx.Identifier(table), columns, pgx.CopyFromFunc(next))
+}
+
+// nativeTx is the rio.NativeTx over one pgx transaction.
 type nativeTx struct {
 	tx pgx.Tx
 	// done latches after Commit/Rollback: the connection is released either
@@ -140,6 +154,14 @@ func (t *nativeTx) finish(ctx context.Context, op func(context.Context) error) e
 	err := op(ctx)
 	t.done = true
 	return doneAsTxDone(err, wasClosed)
+}
+
+func (t *nativeTx) QueryBatch(ctx context.Context, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
+	return sendBatch(ctx, t.tx, stmts)
+}
+
+func (t *nativeTx) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
+	return t.tx.CopyFrom(ctx, pgx.Identifier(table), columns, pgx.CopyFromFunc(next))
 }
 
 // nativeRows assigns one pgtype scanner interface per rio cell so pgx cannot
@@ -180,6 +202,49 @@ func (r *nativeRows) Scan(dest ...any) error {
 		r.translate(dest)
 	}
 	return r.rows.Scan(r.dests...)
+}
+
+// translate builds the pgx destinations once: one typed cell view per rio
+// cell, plain pointers passed through.
+func (r *nativeRows) translate(dest []any) {
+	fds := r.rows.FieldDescriptions()
+	r.cells = make([]pgCell, len(dest))
+	out := make([]any, len(dest))
+	for i, d := range dest {
+		cell, ok := d.(rio.NativeCell)
+		if !ok {
+			out[i] = d // a plain pointer: pgx scans it natively
+			continue
+		}
+		kind := cell.ScanKind()
+		// Numeric falls back to decimal strings to keep the full uint64 range.
+		if kind == rio.NativeKindUint && int(fds[i].DataTypeOID) == pgtype.NumericOID {
+			kind = rio.NativeKindScanner
+		}
+		switch kind {
+		case rio.NativeKindInt, rio.NativeKindUint:
+			r.cells[i].c = cell
+			out[i] = (*intCell)(&r.cells[i])
+		case rio.NativeKindFloat:
+			r.cells[i].c = cell
+			out[i] = (*floatCell)(&r.cells[i])
+		case rio.NativeKindBool:
+			r.cells[i].c = cell
+			out[i] = (*boolCell)(&r.cells[i])
+		case rio.NativeKindString:
+			r.cells[i].c = cell
+			out[i] = (*stringCell)(&r.cells[i])
+		case rio.NativeKindBytes, rio.NativeKindJSON:
+			r.cells[i].c = cell
+			out[i] = (*bytesCell)(&r.cells[i])
+		case rio.NativeKindTime:
+			r.cells[i].c = cell
+			out[i] = (*timeCell)(&r.cells[i])
+		default:
+			out[i] = cell
+		}
+	}
+	r.dests = out
 }
 
 // pgCell backs the per-kind adapter views; each named view keeps its narrow
@@ -280,46 +345,38 @@ func (c *timeCell) setInfinity(m pgtype.InfinityModifier) error {
 	return c.c.SetString(m.String())
 }
 
-func (r *nativeRows) translate(dest []any) {
-	fds := r.rows.FieldDescriptions()
-	r.cells = make([]pgCell, len(dest))
-	out := make([]any, len(dest))
-	for i, d := range dest {
-		cell, ok := d.(rio.NativeCell)
-		if !ok {
-			out[i] = d // a plain pointer: pgx scans it natively
-			continue
-		}
-		kind := cell.ScanKind()
-		// Numeric falls back to decimal strings to keep the full uint64 range.
-		if kind == rio.NativeKindUint && int(fds[i].DataTypeOID) == pgtype.NumericOID {
-			kind = rio.NativeKindScanner
-		}
-		switch kind {
-		case rio.NativeKindInt, rio.NativeKindUint:
-			r.cells[i].c = cell
-			out[i] = (*intCell)(&r.cells[i])
-		case rio.NativeKindFloat:
-			r.cells[i].c = cell
-			out[i] = (*floatCell)(&r.cells[i])
-		case rio.NativeKindBool:
-			r.cells[i].c = cell
-			out[i] = (*boolCell)(&r.cells[i])
-		case rio.NativeKindString:
-			r.cells[i].c = cell
-			out[i] = (*stringCell)(&r.cells[i])
-		case rio.NativeKindBytes, rio.NativeKindJSON:
-			r.cells[i].c = cell
-			out[i] = (*bytesCell)(&r.cells[i])
-		case rio.NativeKindTime:
-			r.cells[i].c = cell
-			out[i] = (*timeCell)(&r.cells[i])
-		default:
-			out[i] = cell
-		}
-	}
-	r.dests = out
+// batchSender is the SendBatch surface shared by pools and transactions.
+type batchSender interface {
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
+
+func sendBatch(ctx context.Context, s batchSender, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
+	b := &pgx.Batch{}
+	for _, st := range stmts {
+		b.Queue(st.SQL, st.Args...)
+	}
+	return &nativeBatchResults{res: s.SendBatch(ctx, b), remaining: len(stmts)}, nil
+}
+
+// nativeBatchResults hands out one wrapped result per queued statement.
+type nativeBatchResults struct {
+	res       pgx.BatchResults
+	remaining int
+}
+
+func (r *nativeBatchResults) Rows() (rio.NativeRows, bool, error) {
+	if r.remaining == 0 {
+		return nil, true, nil
+	}
+	r.remaining--
+	nr, err := wrapRows(r.res.Query())
+	if err != nil {
+		return nil, false, err
+	}
+	return nr, false, nil
+}
+
+func (r *nativeBatchResults) Close() error { return r.res.Close() }
 
 // mapTxOptions matches pgx's database/sql isolation mapping.
 func mapTxOptions(opts *sql.TxOptions) (pgx.TxOptions, error) {
@@ -371,55 +428,4 @@ func wrapRows(rows pgx.Rows, err error) (rio.NativeRows, error) {
 		return nil, err
 	}
 	return &nativeRows{rows: rows}, nil
-}
-
-// --- batching ---
-
-// QueryBatch runs all statements in one round trip; results are ordered, each via wrapRows.
-func (d *nativeDB) QueryBatch(ctx context.Context, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
-	return sendBatch(ctx, d.pool, stmts)
-}
-
-func (t *nativeTx) QueryBatch(ctx context.Context, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
-	return sendBatch(ctx, t.tx, stmts)
-}
-
-type batchSender interface {
-	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
-}
-
-func sendBatch(ctx context.Context, s batchSender, stmts []rio.BatchStatement) (rio.NativeBatchResults, error) {
-	b := &pgx.Batch{}
-	for _, st := range stmts {
-		b.Queue(st.SQL, st.Args...)
-	}
-	return &nativeBatchResults{res: s.SendBatch(ctx, b), remaining: len(stmts)}, nil
-}
-
-type nativeBatchResults struct {
-	res       pgx.BatchResults
-	remaining int
-}
-
-func (r *nativeBatchResults) Rows() (rio.NativeRows, bool, error) {
-	if r.remaining == 0 {
-		return nil, true, nil
-	}
-	r.remaining--
-	nr, err := wrapRows(r.res.Query())
-	if err != nil {
-		return nil, false, err
-	}
-	return nr, false, nil
-}
-
-func (r *nativeBatchResults) Close() error { return r.res.Close() }
-
-// CopyIn streams rows over COPY; the table's name segments map onto pgx.Identifier.
-func (d *nativeDB) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
-	return d.pool.CopyFrom(ctx, pgx.Identifier(table), columns, pgx.CopyFromFunc(next))
-}
-
-func (t *nativeTx) CopyIn(ctx context.Context, table []string, columns []string, next func() ([]any, error)) (int64, error) {
-	return t.tx.CopyFrom(ctx, pgx.Identifier(table), columns, pgx.CopyFromFunc(next))
 }
