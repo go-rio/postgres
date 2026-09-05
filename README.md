@@ -139,6 +139,11 @@ migrations and pings, never for pool configuration.
 
 ### Query exec mode and PgBouncer
 
+`OpenNative` installs `AfterConnect`, which keeps `time`, `inet` and `cidr` in the
+server's text form so string columns read the same as on the database/sql paths;
+`NewNativeFromPool` callers add it to their `pgxpool.Config.AfterConnect`. Arrays
+scan into a string only through database/sql; the native path asks for a slice.
+
 The native path uses pgx's default `cache_statement` mode. Change it with the
 `default_query_exec_mode` DSN parameter or on a caller-built pool config.
 

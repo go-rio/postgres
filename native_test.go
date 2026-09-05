@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestOpenNativeInvalidDSN(t *testing.T) {
@@ -506,4 +507,91 @@ func TestNativeIntegration(t *testing.T) {
 			t.Fatalf("the transaction's write must be rolled back: exists=%v err=%v", gone, err2)
 		}
 	})
+}
+
+// The native path must read the same text a database/sql handle reads: pgx's
+// binary decode of time and inet re-renders them, and a string column in an API
+// or sync payload must not change shape with the driver path.
+func TestNativeStringScansMatchDatabaseSQL(t *testing.T) {
+	dsn := os.Getenv("RIO_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("RIO_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	std, err := Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer std.Close()
+	native, err := OpenNative(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer native.Close()
+
+	for _, expr := range []string{
+		"'08:00:00'::time", "'17:30:00.5'::time", "'08:00:00+08'::timetz", "'1 day 02:03:04'::interval",
+		"'192.168.0.1'::inet", "'10.0.0.0/8'::inet", "'10.0.0.0/8'::cidr", "'::1'::inet",
+		"'12.3400'::numeric", "'{\"a\":1}'::jsonb", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+	} {
+		want, err := rio.Raw[string]("SELECT "+expr).Sole(ctx, std)
+		if err != nil {
+			t.Fatalf("%s via database/sql: %v", expr, err)
+		}
+		got, err := rio.Raw[string]("SELECT "+expr).Sole(ctx, native)
+		if err != nil {
+			t.Fatalf("%s via native: %v", expr, err)
+		}
+		if *got != *want {
+			t.Errorf("%s: native %q, database/sql %q", expr, *got, *want)
+		}
+	}
+}
+
+// pgx hands a nil to the sql.Scanner fallback for an array, which rio would
+// read as NULL; the native path must refuse instead of returning "".
+func TestNativeArrayIntoStringFails(t *testing.T) {
+	dsn := os.Getenv("RIO_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("RIO_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	native, err := OpenNative(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer native.Close()
+
+	_, err = rio.Raw[string]("SELECT ARRAY[1,2]::int[]").Sole(ctx, native)
+	if err == nil || !strings.Contains(err.Error(), "slice destination") {
+		t.Fatalf("expected a slice-destination error, got %v", err)
+	}
+}
+
+// A caller-built pool gets the same text forms once it installs AfterConnect.
+func TestNewNativeFromPoolWithAfterConnect(t *testing.T) {
+	dsn := os.Getenv("RIO_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("RIO_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AfterConnect = AfterConnect
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := NewNativeFromPool(pool)
+	defer db.Close()
+
+	got, err := rio.Raw[string]("SELECT '08:00:00'::time").Sole(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got != "08:00:00" {
+		t.Fatalf("got %q", *got)
+	}
 }

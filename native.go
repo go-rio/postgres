@@ -28,6 +28,7 @@ func OpenNative(ctx context.Context, dsn string, opts ...rio.Option) (*rio.DB, e
 	if bad := nonConformingStringsSetting(cfg.ConnConfig.RuntimeParams); bad != "" {
 		return nil, errNonConformingStrings("open native", bad)
 	}
+	cfg.AfterConnect = AfterConnect
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open native: %w", err)
@@ -232,6 +233,10 @@ func (r *nativeRows) translate(dest []any) {
 			r.cells[i].c = cell
 			out[i] = (*boolCell)(&r.cells[i])
 		case rio.NativeKindString:
+			if name, isArray := arrayTypeName(r.rows, fds[i].DataTypeOID); isArray {
+				out[i] = unsupportedCell{column: fds[i].Name, typeName: name}
+				continue
+			}
 			r.cells[i].c = cell
 			out[i] = (*stringCell)(&r.cells[i])
 		case rio.NativeKindBytes, rio.NativeKindJSON:
@@ -250,6 +255,51 @@ func (r *nativeRows) translate(dest []any) {
 // pgCell backs the per-kind adapter views; each named view keeps its narrow
 // pgx method set.
 type pgCell struct{ c rio.NativeCell }
+
+// AfterConnect keeps the server's text form for the types whose binary decode
+// pgx re-renders differently: time gains six fraction digits and inet/cidr a
+// full-length mask, so a string field read through the native path stopped
+// matching the database/sql paths. OpenNative installs it; NewNativeFromPool
+// callers add it to their pgxpool.Config.AfterConnect.
+func AfterConnect(_ context.Context, conn *pgx.Conn) error {
+	types := conn.TypeMap()
+	for _, oid := range []uint32{pgtype.TimeOID, pgtype.InetOID, pgtype.CIDROID} {
+		typ, ok := types.TypeForOID(oid)
+		if !ok {
+			continue
+		}
+		types.RegisterType(&pgtype.Type{Name: typ.Name, OID: oid, Codec: textCodec{typ.Codec}})
+	}
+	return nil
+}
+
+type textCodec struct{ pgtype.Codec }
+
+func (textCodec) FormatSupported(format int16) bool { return format == pgtype.TextFormatCode }
+
+func (textCodec) PreferredFormat() int16 { return pgtype.TextFormatCode }
+
+// unsupportedCell fails a scan that pgx would otherwise satisfy with nil: an
+// array has no text form on the native path, and a nil would read as NULL.
+type unsupportedCell struct{ column, typeName string }
+
+func (c unsupportedCell) Scan(any) error {
+	return fmt.Errorf("column %s: %s scans into a string only through database/sql; use a slice destination",
+		c.column, c.typeName)
+}
+
+func arrayTypeName(rows pgx.Rows, oid uint32) (string, bool) {
+	conn := rows.Conn()
+	if conn == nil {
+		return "", false
+	}
+	typ, ok := conn.TypeMap().TypeForOID(oid)
+	if !ok {
+		return "", false
+	}
+	_, isArray := typ.Codec.(*pgtype.ArrayCodec)
+	return typ.Name, isArray
+}
 
 type intCell pgCell
 

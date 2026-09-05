@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-06
+
+### Fixed
+
+- The native path reads `time`, `inet` and `cidr` in the server's text form. pgx's binary decode re-rendered them ("08:00:00.000000", "192.168.0.1/32"), so a string column changed shape between the database/sql and native paths. `OpenNative` installs the new `AfterConnect`; `NewNativeFromPool` callers add it to their `pgxpool.Config`.
+- Scanning an array into a string on the native path now fails with a slice-destination error instead of reading back as an empty string.
+
 ## [0.8.4] - 2026-09-02
 
 ### Changed

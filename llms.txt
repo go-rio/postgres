@@ -106,3 +106,7 @@ type Tags []string // Value() encodes pgtype.FlatArray[string]; Scan() decodes i
 - Go Reference: https://pkg.go.dev/github.com/go-rio/postgres
 - Core ORM: https://github.com/go-rio/rio
 - Issues: https://github.com/go-rio/postgres/issues
+
+### Native text forms
+
+`OpenNative` installs `AfterConnect` so `time`, `inet` and `cidr` keep the server's text form; add it to a caller-built `pgxpool.Config` for `NewNativeFromPool`. Arrays into `string` fail on the native path; scan into a slice.
