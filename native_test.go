@@ -509,9 +509,6 @@ func TestNativeIntegration(t *testing.T) {
 	})
 }
 
-// The native path must read the same text a database/sql handle reads: pgx's
-// binary decode of time and inet re-renders them, and a string column in an API
-// or sync payload must not change shape with the driver path.
 func TestNativeStringScansMatchDatabaseSQL(t *testing.T) {
 	dsn := os.Getenv("RIO_POSTGRES_DSN")
 	if dsn == "" {
@@ -548,8 +545,6 @@ func TestNativeStringScansMatchDatabaseSQL(t *testing.T) {
 	}
 }
 
-// pgx hands a nil to the sql.Scanner fallback for an array, which rio would
-// read as NULL; the native path must refuse instead of returning "".
 func TestNativeArrayIntoStringFails(t *testing.T) {
 	dsn := os.Getenv("RIO_POSTGRES_DSN")
 	if dsn == "" {
@@ -568,7 +563,6 @@ func TestNativeArrayIntoStringFails(t *testing.T) {
 	}
 }
 
-// A caller-built pool gets the same text forms once it installs AfterConnect.
 func TestNewNativeFromPoolWithAfterConnect(t *testing.T) {
 	dsn := os.Getenv("RIO_POSTGRES_DSN")
 	if dsn == "" {

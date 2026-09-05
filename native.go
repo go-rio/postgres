@@ -256,11 +256,6 @@ func (r *nativeRows) translate(dest []any) {
 // pgx method set.
 type pgCell struct{ c rio.NativeCell }
 
-// AfterConnect keeps the server's text form for the types whose binary decode
-// pgx re-renders differently: time gains six fraction digits and inet/cidr a
-// full-length mask, so a string field read through the native path stopped
-// matching the database/sql paths. OpenNative installs it; NewNativeFromPool
-// callers add it to their pgxpool.Config.AfterConnect.
 func AfterConnect(_ context.Context, conn *pgx.Conn) error {
 	types := conn.TypeMap()
 	for _, oid := range []uint32{pgtype.TimeOID, pgtype.InetOID, pgtype.CIDROID} {
@@ -279,8 +274,6 @@ func (textCodec) FormatSupported(format int16) bool { return format == pgtype.Te
 
 func (textCodec) PreferredFormat() int16 { return pgtype.TextFormatCode }
 
-// unsupportedCell fails a scan that pgx would otherwise satisfy with nil: an
-// array has no text form on the native path, and a nil would read as NULL.
 type unsupportedCell struct{ column, typeName string }
 
 func (c unsupportedCell) Scan(any) error {
