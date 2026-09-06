@@ -463,12 +463,15 @@ func wrapRows(rows pgx.Rows, err error) (rio.NativeRows, error) {
 		}
 		return nil, err
 	}
-	if rows.Next() {
-		return &nativeRows{rows: rows, hasPreloadedRow: true}, nil
+	wrapped := &nativeRows{rows: rows}
+	// Next can release an empty result's pooled connection; retain its column names first.
+	wrapped.Columns()
+	if wrapped.hasPreloadedRow = rows.Next(); wrapped.hasPreloadedRow {
+		return wrapped, nil
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return nil, err
 	}
-	return &nativeRows{rows: rows}, nil
+	return wrapped, nil
 }

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-07
+
+### Fixed
+
+- Cache native result column names before prefetching the first row. Empty results can return their connection to the pool during prefetch; reading column descriptions afterward could race with a subsequent query and return the wrong column names.
+
 ## [0.8.5] - 2026-09-06
 
 ### Fixed
@@ -132,7 +138,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release: `Open` and `New` over pgx's database/sql adapter, duplicate-key and foreign-key error translation.
 
-[Unreleased]: https://github.com/go-rio/postgres/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/go-rio/postgres/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/go-rio/postgres/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/go-rio/postgres/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/go-rio/postgres/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/go-rio/postgres/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/go-rio/postgres/compare/v0.8.1...v0.8.2

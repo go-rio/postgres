@@ -17,6 +17,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type releasedFieldRows struct {
+	fieldRows
+}
+
+func (r releasedFieldRows) Next() bool {
+	r.fields[0].Name = "next_query"
+	return false
+}
+
+func TestWrapRowsRetainsColumnsAfterEmptyResultRelease(t *testing.T) {
+	rows := releasedFieldRows{fieldRows{fields: []pgconn.FieldDescription{{Name: "sku_id"}}}}
+	wrapped, err := wrapRows(rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if columns := wrapped.Columns(); len(columns) != 1 || columns[0] != "sku_id" {
+		t.Fatalf("columns after connection reuse = %v, want [sku_id]", columns)
+	}
+}
+
 func TestOpenNativeInvalidDSN(t *testing.T) {
 	if _, err := OpenNative(context.Background(), "postgres://u@host:not-a-port/db"); err == nil {
 		t.Fatal("OpenNative must validate the DSN eagerly")
